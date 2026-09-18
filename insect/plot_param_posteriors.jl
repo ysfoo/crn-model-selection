@@ -9,6 +9,7 @@ using AdvancedHMC, Bijectors, BridgeSampling, LogDensityProblems, LogDensityProb
 
 # Posterior plots
 
+# dir_idx = 3
 dir_idx = 25;
 genmodel_idx = feasible_idxs[dir_idx];
 OUTDIR = joinpath(@__DIR__, "output/data$(dir_idx)");
@@ -27,7 +28,7 @@ for model_idx in [64]
     d = nparams[model_idx]
     ps = parameters(models[model_idx])
     
-    mcmc_fname = joinpath(OUTDIR, "chains_model$(model_idx).jld2")
+    mcmc_fname = joinpath(OUTDIR, "chains7000_model$(model_idx).jld2")
     @nowarn_load mcmc_fname chn
     trace = permutedims(chn.value[:,1:d,:].data, [2, 1, 3]);
     samples = reshape(trace, d, :);
@@ -44,7 +45,7 @@ for model_idx in [64]
         # eachcol(exp10.(X)),
         eachcol(X),
         [MAP], [Σ],
-        # title="Posterior samples under model $model_idx for data generated from model $genmodel_idx", titlesize=17,
+        # title="Posterior samples under model $model_idx\nfor data generated from model $genmodel_idx",
         title=L"\textbf{Posterior samples under saturated model for data generated with death mechanisms }\delta_E,\, \delta_L,\, \delta_A,\, \kappa_L", 
         titlesize=20,
         figsize=(120*d+40, 120*d+40), skip_upper=true,

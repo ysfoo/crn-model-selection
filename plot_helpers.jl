@@ -1,6 +1,8 @@
 ### Plotting helpers
 
-using CairoMakie, LaTeXStrings, LinearAlgebra
+using CairoMakie, LaTeXStrings
+using Accessors, DataPipes
+using LinearAlgebra
 set_theme!(theme_latexfonts());
 update_theme!(
 	Axis=(;
@@ -100,6 +102,13 @@ function plot_pairs(
 end
 
 
+function add_boxplots!(xs, vecs, tf=identity; kwargs...)
+    for (x, vals) in zip(xs, vecs)
+        boxplot!(fill(x, length(vals)), vals .|> tf; markersize=6, kwargs...)
+    end
+end
+
+
 # Make square root scale work for negative values
 function symsqrt(x)
 	sign(x)*sqrt(abs(x))
@@ -119,3 +128,34 @@ function get_pos_sqrt_ticks(maxval)
 	lower_filter = all_ticks .>= 0.02*maxval
 	return [0.0; all_ticks[upper_filter .& lower_filter]]
 end
+
+
+## Source: https://github.com/JuliaAPlavin/MakieExtra.jl/blob/000000000f9a024e4769eefea8653e1b48879ba1/src/ticks.jl
+
+@kwdef struct BaseMulTicks
+    subs = nothing
+    base = 10.
+    k_min::Int = 7
+end
+BaseMulTicks(subs; kwargs...) = BaseMulTicks(; subs, kwargs...)
+
+function Makie.get_tickvalues(t::BaseMulTicks, vmin, vmax)
+    vmin < vmax || return []
+    vmin < 0 && vmax ≤ 0 && return .-Makie.get_tickvalues(t, -vmax, -vmin)
+    @assert vmin ≥ 0 && vmax ≥ 0
+    if !isnothing(t.subs)
+        @p [
+            mul * t.base^pow
+            for pow in floor(Int, log(t.base, vmin) - 0.1):ceil(Int, log(t.base, vmax) + 0.1)
+            for mul in t.subs
+        ] filter!(∈(vmin..vmax)) map(round(_, sigdigits=4)) map(isinteger(_) ? Int(_) : _)
+    else
+        for subs in [[1], [1,3], [1,2,5], [1,2,3,5], 1:9]
+            ticks = Makie.get_tickvalues((@set t.subs = subs), vmin, vmax)
+            length(ticks) ≥ t.k_min && return ticks
+        end
+        return Makie.get_tickvalues(WilkinsonTicks(5), vmin, vmax)
+    end
+end
+
+Makie.get_minor_tickvalues(t::BaseMulTicks, scale, tickvals, vmin, vmax) = Makie.get_tickvalues(t, scale, vmin, vmax)

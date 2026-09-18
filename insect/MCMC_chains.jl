@@ -35,7 +35,7 @@ function main(model_idx)
     # n_chains = 2
 
     mcmc_fname = joinpath(OUTDIR, "chains$(n_sample)_model$(model_idx).jld2")
-    isfile(mcmc_fname) && return false
+    # isfile(mcmc_fname) && return false
 
     pmodel = create_petab_model(models[model_idx], data, u0)
     petab_prob = PEtabODEProblem(pmodel; odesolver=ODESolver(Rodas5P(), verbose=false))
@@ -45,7 +45,7 @@ function main(model_idx)
     Σ = inv(PDMat(hermitianpart!(hess)))
 
     seed = model_idx
-    rng = StableRNG(seed)
+    rng = StableRNG(seed + 2026)
 
     init_params = [
         begin
@@ -88,8 +88,15 @@ function main(model_idx)
 end
 return true
 
-# for model_idx in [50]
-for model_idx in 1:n_models
+model_idxs = 1:n_models
+# if dir_idx == 3
+#     model_idxs = [10]
+# end
+# if dir_idx == 5
+#     model_idxs = [25]
+# end
+
+for model_idx in model_idxs
     ran = main(model_idx);
 end
 

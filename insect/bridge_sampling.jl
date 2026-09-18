@@ -60,12 +60,17 @@ function bridge_sampling(target, d, chn, bridge_idxs, fit_idxs)
     return LML_mix
 end
 
-# for model_idx in [50]
-for model_idx in 1:n_models
+model_idxs = 1:n_models
+# if dir_idx == 3
+#     model_idxs = [10]
+# end
+# if dir_idx == 5
+#     model_idxs = [25]
+# end
+
+for model_idx in model_idxs
     fname = joinpath(OUTDIR, "BSnew_model$(model_idx).jld2")
-    if isfile(fname)
-        continue
-    end
+    # isfile(fname) && return false
     println("Model $(model_idx)")
     flush(stdout); flush(stderr);
 

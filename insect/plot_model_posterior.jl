@@ -134,7 +134,7 @@ ents = [
         (logps .+ log.(.-logps)) |> logsumexp |> exp
     end for logZvec in BS_logZvecs
 ];
-tvds = calc_tvd.(orig_logZvecs, BS_logZvecs);
+tvds = calc_tvd.(rAMIS_logZvecs, BS_logZvecs);
 
 [sortperm(ents) sort(ents) tvds[sortperm(ents)]]
 

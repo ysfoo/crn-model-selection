@@ -14,8 +14,8 @@ using AdvancedHMC, Bijectors, LinearAlgebra, LogDensityProblems, LogDensityProbl
 @load joinpath(@__DIR__, "data.jld2") all_data;
 
 # Posterior variance
-vrats_fname = joinpath(@__DIR__, "output/var_ratios.jld2")
-LOAD_VAR_RATIOS = true
+vrats_fname = joinpath(@__DIR__, "output/var_ratios.jld2");
+LOAD_VAR_RATIOS = true;
 if LOAD_VAR_RATIOS
     @load vrats_fname var_ratios
 else
@@ -26,7 +26,7 @@ else
 
         for model_idx in 1:n_models
             d = nparams[model_idx]
-            chains_fname = "$OUTDIR/chains_model$model_idx.jld2"
+            chains_fname = "$OUTDIR/chains7000_model$model_idx.jld2"
             @load chains_fname chn
             trace = permutedims(chn.value[:,1:d,:].data, [2, 1, 3]);
             X = reshape(trace, d, :);
@@ -39,15 +39,56 @@ else
     @save vrats_fname var_ratios
 end
 
-heatmap(log.(var_ratios))
-findall(>(1), var_ratios)
 size(var_ratios)
+# heatmap(log.(var_ratios))
+findall(>(1), var_ratios)
+sort(vec(var_ratios), rev=true)[1:10]
+
 
 hist(sqrt.(vec(var_ratios)), bins=0:0.1:1)
 sum(abs.(sqrt.(vec(var_ratios)) .- 0.55) .< 0.05)
-1401/2816
+# 1401/2816
+1458/2816
 
-# Effective sample sizes
+begin
+    dir_idx = 3
+    OUTDIR = joinpath(@__DIR__, "output/data$(dir_idx)");
+
+    model_idx = 41
+    d = nparams[model_idx]
+    chains_fname = "$OUTDIR/chains7000_model$model_idx.jld2"
+    @load chains_fname chn    
+    trace = permutedims(chn.value[:,1:d,:].data, [2, 1, 3]);
+    X = reshape(trace, d, :);
+
+    postvars = vec(var(X; dims=2))
+    priorvars = [fill(4., d-1); 1.]
+    # display([priorvars postvars])
+
+    params = names(chn, :parameters)
+
+    n_chains = length(chains(chn))
+    n_samples = length(chn)
+
+    fig = Figure(size=(600, 900))
+
+    for (i, param) in enumerate(params)
+        ax = Axis(fig[i, 1]; ylabel=string(param))
+        for chain in 1:n_chains
+            values = chn[:, param, chain]
+            lines!(ax, 1:n_samples, values; label=string(chain), alpha=0.5)
+        end
+        if i < length(params)
+            hidexdecorations!(ax; grid=false)
+        else
+            ax.xlabel = "Iteration"
+        end
+    end
+
+    fig
+end
+
+# Importance sampling effective sample sizes
 ess_fname = joinpath(@__DIR__, "output/ess.jld2");
 LOAD_ESS = true
 if LOAD_ESS
@@ -77,17 +118,6 @@ else
     @save ess_fname LIS_essmat orig_essmat rAMIS_essmat rAMIS_khatmat
 end
 
-# @showprogress for dir_idx in 1:n_feasible
-#     OUTDIR = joinpath(@__DIR__, "output/data$(dir_idx)");
-#     for model_idx in 1:n_models
-#         fname = "$OUTDIR/robust_AMIS_model$model_idx.jld2"
-#         @load fname timed_res
-#         rAMIS_khatmat[dir_idx, model_idx] = timed_res.value.pareto_shape
-#     end
-# end
-
-# @save ess_fname LIS_essmat orig_essmat rAMIS_essmat rAMIS_khatmat
-
 MCMCstats_fname = joinpath(@__DIR__, "output/MCMCstats.jld2");
 LOAD_MCMCSTATS = true;
 if LOAD_MCMCSTATS
@@ -99,7 +129,7 @@ else
     @showprogress for dir_idx in 1:n_feasible
         OUTDIR = joinpath(@__DIR__, "output/data$(dir_idx)")
         for model_idx in 1:n_models
-            fname = joinpath(OUTDIR, "chains_model$(model_idx).jld2");
+            fname = joinpath(OUTDIR, "chains7000_model$(model_idx).jld2");
             @load fname chn ess_df
             push!(MCMC_miness[dir_idx], minimum(ess_df.nt.ess))
             push!(MCMC_maxrhat[dir_idx], maximum(rhat(chn).nt.rhat))
@@ -112,11 +142,27 @@ end
 MCMC_essmat = stack(MCMC_miness)';
 summarystats((MCMC_times ./ 60) .|> sum)
 
-heatmap(MCMC_essmat)
+hist(vec(MCMC_essmat), bins=0:100:2000)
+summarystats(vec(MCMC_essmat))
+
+tmp_idxs = partialsortperm(vec(MCMC_essmat), 1:10);
+top_idxs = CartesianIndices(MCMC_essmat)[tmp_idxs]
+MCMC_essmat[top_idxs]
+
+sum(reduce(vcat, MCMC_maxrhat) .> 1.01)
+maximum(MCMC_maxrhat .|> maximum)
+for dir_idx in 1:n_feasible
+    for model_idx in 1:n_models
+        if MCMC_maxrhat[dir_idx][model_idx] > 1.01
+            display((dir_idx, model_idx))
+        end
+    end
+end
+
 
 # OUTDIR = joinpath(@__DIR__, "output/data25")
 # for model_idx in 1:n_models
-#     fname = joinpath(OUTDIR, "chains_model$(model_idx).jld2");
+#     fname = joinpath(OUTDIR, "chains7000_model$(model_idx).jld2");
 #     @load fname chn
 #     display(chn.info.stop_time .- chn.info.start_time)
 #     display(diff(sort(chn.info.start_time)))
@@ -128,6 +174,7 @@ heatmap(MCMC_essmat)
 # 7*24+17 # cpu utilized
 
 logZs_fname = joinpath(@__DIR__, "output/logZs.jld2");
+
 LOAD_LOGZS = true
 if LOAD_LOGZS
     @load logZs_fname all_times BIC_logZvecs LIS_logZvecs orig_logZvecs rAMIS_logZvecs BS_logZvecs
@@ -190,11 +237,11 @@ else
             logp_rAMIS = logsumexp(logws) - log(N)
             push!(rAMIS_logZvecs[dir_idx], logp_rAMIS)
 
-            fname = "$OUTDIR/chains_model$model_idx.jld2"
+            fname = "$OUTDIR/chains7000_model$model_idx.jld2"
             @load fname chn
             chains_time += MCMCChains.compute_duration(chn) / 60
 
-            fname = "$OUTDIR/BS_model$model_idx.jld2"
+            fname = "$OUTDIR/BSnew_model$model_idx.jld2"
             @load fname timed_res
             BS_time += timed_res.time / 60
             push!(BS_logZvecs[dir_idx], timed_res.value.value)
@@ -223,6 +270,10 @@ LIS_errors = reduce(vcat, LIS_logZvecs .- BS_logZvecs);
 orig_errors = reduce(vcat, orig_logZvecs .- BS_logZvecs);
 rAMIS_errors = reduce(vcat, rAMIS_logZvecs .- BS_logZvecs);
 
+mean(LIS_errors .|> abs .< 0.1)
+mean(orig_errors .|> abs .< 0.1)
+mean(rAMIS_errors .|> abs .< 0.1)
+
 BIC_tvds = calc_tvd.(BIC_logZvecs, BS_logZvecs);
 LIS_tvds = calc_tvd.(LIS_logZvecs, BS_logZvecs);
 orig_tvds = calc_tvd.(orig_logZvecs, BS_logZvecs);
@@ -248,6 +299,13 @@ summarystats(hrs_mat[5,:]) # BS
 # summarystats(LIS_tvds)
 summarystats(orig_tvds)
 summarystats(rAMIS_tvds)
+
+sortperm(rAMIS_tvds)
+
+dir_idx = 20
+pdiffs = pvecs_rAMIS[dir_idx] .- pvecs_BS[dir_idx];
+scatter(MCMC_essmat[dir_idx,:], pdiffs)
+
 
 COLORS = [:grey60; Makie.wong_colors()[[1, 3, 4, 2]]];
 method_names = ["BIC", "Laplace IS", "Standard AMIS", "Robust AMIS", "Bridge sampling"];
@@ -434,9 +492,11 @@ begin
             alpha=0.6, markersize=8
         )
         colsize!(f.layout, i, Auto(maximum(vcat_pvecs_other)-minimum(vcat_pvecs_other)))
+        if i == 4
+            Colorbar(f[1,end+1], sc, ticklabelsize=16, label="Max posterior-to-prior SD ratio", labelsize=18)
+        end
     end
     # colgap!(f.layout, 0)
-    Colorbar(f[1,end+1], sc, ticklabelsize=16, label="Max posterior-to-prior SD ratio", labelsize=18)
     Label(f[0,:], "Comparison of model posterior probabilities", fontsize=20, font=:bold)
     display(f)
     save_dir = mkpath(joinpath(@__DIR__, "imgs/"));
@@ -471,7 +531,7 @@ begin
     display(f)
 end
 
-# exit()
+exit()
 
 ## Playground
 
@@ -500,9 +560,7 @@ end
 
 
 # quantile.(Ref(rAMIS_errors .|> abs), 0.05:0.05:0.95)
-# mean(LIS_errors .|> abs .< 0.1)
-# mean(orig_errors .|> abs .< 0.1)
-# mean(rAMIS_errors .|> abs .< 0.1)
+
 
 # mean(LIS_essmat .> 1e4)
 # mean(orig_essmat .> 1e4)
@@ -691,6 +749,17 @@ end
 #     save_dir = mkpath(joinpath(@__DIR__, "imgs/"));
 #     save("$(save_dir)/comparison_insect.png", f, px_per_unit=4);
 # end
+
+for dir_idx in 1:44
+    logZdiffs = rAMIS_logZvecs[dir_idx] .- BS_logZvecs[dir_idx];
+    for model_idx in 1:64
+        essval = rAMIS_essmat[dir_idx, model_idx]
+        if essval > 1e5 && logZdiffs[model_idx] < -0.2
+            @info "Outlier" dir_idx model_idx MCMC_essmat[dir_idx, model_idx]
+        end
+    end
+end
+
 
 hist(log10.(var_ratios_vec))
 hist(sqrt.(var_ratios_vec))
