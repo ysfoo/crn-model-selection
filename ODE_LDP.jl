@@ -4,7 +4,7 @@ using ForwardDiff, DiffResults
 using PreallocationTools: DiffCache, get_tmp
 using SymbolicIndexingInterface: parameter_index
 
-struct OrdinaryDiffEqLDP{LP, LL, UP, UU, ALG, KW, CR, CC}
+struct OrdinaryDiffEqLDP{LP, LL, UP, UU, ALG, KW, CR, CC, TC1, TC2}
     base_prob          :: ODEProblem
     n_θ                :: Int
     log_prior          :: LP
@@ -15,8 +15,8 @@ struct OrdinaryDiffEqLDP{LP, LL, UP, UU, ALG, KW, CR, CC}
     u0_idxs            :: Vector{Int}
     solver             :: ALG
     solve_kwargs       :: KW
-    tunable_diffcache  :: DiffCache
-    initials_diffcache :: DiffCache
+    tunable_diffcache  :: TC1
+    initials_diffcache :: TC2
     diffresult         :: CR
     gradconfig         :: CC
 end

@@ -13,24 +13,24 @@ LinearAlgebra.BLAS.set_num_threads(1)
 
 # This script takes one command-line argument, which is the index of `feasible_idxs`.
 dir_idx = parse(Int64, ARGS[1])
-# dir_idx = 25
+# dir_idx = 9
 
 @load joinpath(@__DIR__, "data.jld2") all_data;
 data = all_data[feasible_idxs[dir_idx]];
-n_obs = length(data.t)
-data_mat = hcat(data.data_E, data.data_L, data.data_A) # N x 3
+n_obs = length(data.t);
+data_mat = hcat(data.data_E, data.data_L, data.data_A); # N x 3
 
-rx_sys = models[end]
-n_θ = length(parameters(rx_sys))
-std_idxs = 1:3 # ODE parameters with standard prior
-ss_idxs = 4:9 # ODE parameters with spike-and-slab prior
-noise_idx = 10
-n_ss = length(ss_idxs)
+rx_sys = models[end];
+n_θ = length(parameters(rx_sys));
+std_idxs = 1:3; # ODE parameters with standard prior
+ss_idxs = 4:9; # ODE parameters with spike-and-slab prior
+noise_idx = 10;
+n_ss = length(ss_idxs);
 
-base_oprob = ODEProblem(rx_sys, u0, (0.0, 10.0), [p => 1. for p in parameters(rx_sys)]);
+base_oprob = ODEProblem(rx_sys, u0, (0.0, 10.0), [p => 1. for p in parameters(rx_sys)]; abstol=1e-6, reltol=1e-6);
 
-param_idxs = map((x)->parameter_index(base_oprob, x).idx, parameters(rx_sys))
-u0_idxs = map((x)->parameter_index(base_oprob, Initial(x)).idx, unknowns(rx_sys))
+param_idxs = map((x)->parameter_index(base_oprob, x).idx, parameters(rx_sys));
+u0_idxs = map((x)->parameter_index(base_oprob, Initial(x)).idx, unknowns(rx_sys));
 
 ode_params!(buf, θ) = for i in 1:n_θ
     buf[i] = exp10(θ[i]) 
@@ -41,85 +41,26 @@ param_labels = [
     L"\delta_E", L"\delta_L", L"\delta_A", 
     L"\kappa_E", L"\kappa_L", L"\kappa_A", L"\sigma"
 ];
-sym2label = Dict(zip(Symbol.(parameters(models[end])), param_labels))
-
-function make_fig(particles, iter)
-    pop_size = length(particles)
-    f = plot_pairs(
-        getproperty.(particles, :state);
-        title="Iteration $iter",
-        figsize=(1000, 1000), skip_upper=true,
-        axis_kwargs=(;), hist_axis_kwargs=(; yscale=identity),
-        scatter_kwargs=(; markersize=4, alpha=clamp(1000 / pop_size * 0.3, 0.01, 0.5)),
-        hist_kwargs=(bins=50,),
-    )
-    Box(f[ss_idxs, ss_idxs], color=(:green, 0.2), strokevisible=false)
-
-    ps = parameters(models[end])
-    d = n_θ
-    idx = 0
-    for (i1, p1) in enumerate(ps) # which row
-        for (i2, p2) in enumerate(ps) # which column
-            if i1 < i2
-                continue
-            end
-            idx += 1
-            ax = f.content[idx]
-            if i1 == i2
-                ax.yaxisposition = :right
-                ax.yticklabelsize = 14
-                ax.yticklabelpad = 0.5
-                ax.yticksvisible = true
-                ax.yticklabelsvisible = true
-            elseif i2 ∈ [1, d]
-                ax.yaxisposition = i2 == 1 ? :left : :right
-                ax.ylabel = L"\log_{10} %$(sym2label[Symbol(p1)])"
-                ax.ylabelsize = 18
-                ax.yticks = WilkinsonTicks(6; k_min = 3, k_max=6)
-                ax.yticklabelsize = 14
-                ax.yticksvisible = true
-                ax.yticklabelsvisible = true                
-            else
-                ax.yticksvisible = false
-                ax.yticklabelsvisible = false
-            end
-            
-            if i1 ∈ [d]
-                ax.xaxisposition = i1 == 1 ? :top : :bottom
-                ax.xlabel = L"\log_{10} %$(sym2label[Symbol(p2)])"
-                ax.xlabelsize = 18
-                ax.xticks = WilkinsonTicks(6; k_min = 3, k_max=6)
-                ax.xticklabelrotation = π/4
-                ax.xticklabelsize = 14
-            else
-                ax.xticksvisible = false
-                ax.xticklabelsvisible = false
-            end
-        end
-    end
-    colgap!(f.layout, -8)
-    return f
-end
+sym2label = Dict(zip(Symbol.(parameters(models[end])), param_labels));
 
 # esize = 4;
-μ_noise, σ_noise = -1, 1;
+μ_noise, σ_noise = -1., 1.;
 μ_slab, σ_slab = 0., 2.;
-μ_spike = -16; σ_spike = σ_slab;
+μ_spike = -16.; σ_spike = σ_slab;
+thres = 0.5 * (μ_spike + μ_slab);
+μ0 = -8.;
+
 noise_prior = Normal(μ_noise, σ_noise)
 slab_prior = Normal(μ_slab, σ_slab)
 spike_prior = Normal(μ_spike, σ_spike)
 
-
-function interpolate_ss(idx, μ0, σ0, μ_trg, σ_trg, temper_prior)
-    if n_priors == 1
-        return temper_prior ? Normal(μ0, σ0) : Normal(μ_trg, σ_trg)
-    end
-    n_inter = n_priors-1
-    r = σ_trg/σ0
-    σ = exp(log(σ0) + (idx/n_inter)*log(r))
-    μ = μ0 + (1-r^(idx/n_inter))/(1-r)*(μ_trg - μ0)
-    return Normal(μ, σ)
-end
+final_ss_prior = MixtureModel([slab_prior, spike_prior]);
+final_dists = [
+    fill(slab_prior, length(std_idxs));
+    fill(final_ss_prior, length(ss_idxs));
+    noise_prior
+];
+final_logprior_func(θ) = sum(logpdf(dist, val) for (dist, val) in zip(final_dists, θ));
 
 function sq_hellinger(dist1, dist2)
     avg_var = (dist1.σ^2 + dist2.σ^2) / 2
@@ -127,7 +68,7 @@ function sq_hellinger(dist1, dist2)
     return 1 - overlap
 end
 
-function make_ldp(logprior_func::Function, β::Float64, loglike_offset::Function=(θ)->0.)
+function make_ldp(logprior_func::LPF, β::Float64, loglike_offset::Function=(θ)->0.) where LPF
     function loglike_func(sol, θ::AbstractVector{T}) where T
         σ = exp10(θ[noise_idx])
         ll = T(-n_u*n_obs*log(2π)/2)
@@ -142,12 +83,17 @@ function make_ldp(logprior_func::Function, β::Float64, loglike_offset::Function
         return (ll + loglike_offset(θ)) * β
     end
     return OrdinaryDiffEqLDP(
-        base_oprob, param_idxs, ode_params!, logprior_func, loglike_func, n_θ;
+        base_oprob, param_idxs, ode_params!, θ -> logprior_func(θ, β), loglike_func, n_θ;
+        solver = AutoTsit5(Rodas5P()),
         solve_kwargs = (saveat=data.t, verbose=false),
     )
 end
 
-function partition_by_thres(states::AbstractVector, thres::Float64)
+function run_10(particles, last_n_nuts, npass, states_before_move; verbose = 0, rng=Random.default_rng())
+    return npass < 1 ? 10 : 0
+end
+
+function partition_by_thres(states::AbstractVector, thres::Float64; ss_idxs=ss_idxs)
     classes = Dict{BitVector, Vector{Int}}()
     for (i, θ) in enumerate(states)
         key = BitVector(θ[j] > thres for j in ss_idxs)
@@ -156,31 +102,16 @@ function partition_by_thres(states::AbstractVector, thres::Float64)
     return classes
 end
 
-function no_rerun(particles, prev_states, iter, npass, targetinfo; verbose = 0)
-    return false
-end
-
-function rerun_2(particles, prev_states, iter, npass, targetinfo; verbose = 0)
-    return npass < 2
-end
-
-function rerun_by_kendall!(
-    particles, prev_states, iter, npass, targetinfo;
-    min_count = 20, verbose = 0, update_stepsize=false
+function n_nuts_by_kendall(
+    particles, last_n_nuts, npass, prev_states;
+    thres=thres, init_n_nuts=10, min_count=20,
+    verbose=0, rng=Random.default_rng(),
 )
-    pop_size = length(particles)
-    if update_stepsize
-        mean_acc_rate = mean(p.info.curr_acc_rate for p in particles)
-        new_stepsize = particles[1].stepsize * 1.5^((mean_acc_rate-0.8)/0.2)
-        for i in 1:pop_size
-            particle = particles[i]
-            particles[i] = (@set particle.stepsize = new_stepsize)
-        end
+    if isnothing(last_n_nuts)
+        return init_n_nuts
     end
 
     D = length(prev_states[1])
-    thres = thres_vec[targetinfo[1]]
-
     curr_states = [p.state for p in particles]
     prev_classes = partition_by_thres(prev_states, thres)
 
@@ -191,102 +122,152 @@ function rerun_by_kendall!(
         pairs = n_idxs*(n_idxs-1)÷2
         tied_pairs = sum(t*(t-1)÷2 for t in ties; init=0)
         # cor_thres = kendall_qt(n_idxs, 1e-4, ties) + 0.2
-        cor_thres = 0.2 + 0.8 * sqrt(min_count / n_idxs)
+        cor_thres = 0.1 + 0.9 * sqrt(min_count / n_idxs)
         for d in 1:D
             c = corkendall(getindex.(prev_states[pre_idxs], d), getindex.(curr_states[pre_idxs], d))
             if c > cor_thres
                 if verbose > 0
-                    @info "Rerun due to $key, dimension $d" length(pre_idxs) (n_idxs, tied_pairs) (c, cor_thres)
+                    @info "Rerun due to $key, dimension $d" (n_idxs, tied_pairs) (c, cor_thres)
                 end
-                return true
+                return init_n_nuts
             end
         end
     end
-    return false
+    return 0
 end
 
-### Configure run
+# Decide whether to extend NUTS based on detailed balance.
+function n_nuts_by_detbal(
+    particles, last_n_nuts, npass, states_before_move;
+    thres=thres, init_n_nuts=10, 
+    α=0.1, n_rand=10_000,
+    verbose=0, rng=Random.default_rng(),
+)
+    if isnothing(last_n_nuts)
+        return init_n_nuts
+    end
 
-μ0, σ0 = -8., 4.;
-n_priors = 1;
+    # if any(p->p.info.esjd == 0., particles)
+    #     return 2 * last_n_nuts
+    # end
 
-# A. Temper likelihood and prior, adapt # NUTS iterations, particle-specific step size
-# run_str = "SMC662"
-# temper_prior = true;
-# move_func = nuts_move;
-# rerun_func = rerun_by_kendall!;
-# ldp_builder = (logprior_func, β) -> make_ldp(logprior_func, β, θ -> final_logprior_func(θ) - logprior_funcs[begin](θ));
+    pop_size = length(particles)
 
-# B. Temper likelihood only, adapt # NUTS iterations, particle-specific step size
-# run_str = "SMC262"
-# temper_prior = false;
-# move_func = nuts_move;
-# rerun_func = rerun_by_kendall!;
-# ldp_builder = make_ldp;
+    prev_states = [p.state .- p.info.delta for p in particles]
+    curr_states = [p.state for p in particles]
 
-# C. Temper likelihood and prior, 2 * 6 NUTS iterations, particle-specific step size
-# run_str = "SMC602"
-# temper_prior = true;
-# move_func = (rng, particle, target) -> nuts_move(rng, particle, target; n_nuts=6);
-# rerun_func = (particles, prev_states, iter, npass, targetinfo; verbose=0) -> npass < 2;
-# ldp_builder = (logprior_func, β) -> make_ldp(logprior_func, β, θ -> final_logprior_func(θ) - logprior_funcs[begin](θ));
+    prev_classes = partition_by_thres(prev_states, thres)
+    curr_classes = partition_by_thres(curr_states, thres)
 
-# D. Temper likelihood and prior, adapt # NUTS iterations, shared step size
-run_str = "SMC660"
-temper_prior = true;
-move_func = (rng, particle, target) -> nuts_move(rng, particle, target; adapt_stepsize_func=no_adapt_func);
-rerun_func = (
-    (particles, prev_states, iter, npass, targetinfo; verbose=0) 
-    -> rerun_by_kendall!(particles, prev_states, iter, npass, targetinfo; verbose, update_stepsize=true)
-);
-ldp_builder = (logprior_func, β) -> make_ldp(logprior_func, β, θ -> final_logprior_func(θ) - logprior_funcs[begin](θ));
+    # Label the components (spike/slab modes).
+    keys_union = unique([collect(keys(prev_classes)); collect(keys(curr_classes))])
+    comp_id = Dict(k => i for (i, k) in enumerate(keys_union))
 
-### End configure
+    prev_comp = Vector{Int}(undef, pop_size)
+    curr_comp = Vector{Int}(undef, pop_size)
+    for (key, inds) in prev_classes
+        prev_comp[inds] .= comp_id[key]
+    end
+    for (key, inds) in curr_classes
+        curr_comp[inds] .= comp_id[key]
+    end
 
-slab_seq = interpolate_ss.(0:(n_priors-1), μ0, σ0, μ_slab, σ_slab, temper_prior);
-spike_seq = interpolate_ss.(0:(n_priors-1), μ0, σ0, μ_spike, σ_spike, temper_prior);
-thres_vec = 0.5 .* (getproperty.(slab_seq, :μ) .+ getproperty.(spike_seq, :μ))
-logprior_funcs = [
-    begin
-        mix_prior = MixtureModel([slab, spike])
-        dists = [
-            fill(slab_prior, length(std_idxs));
-            fill(mix_prior,  length(ss_idxs));
-            noise_prior
-        ]
-        (θ) -> sum(logpdf(dist, val) for (dist, val) in zip(dists, θ))
-    end for (slab, spike) in zip(slab_seq, spike_seq)
-];
+    # -1 if switched from >thres to <thres, 1 if opposite, 0 if stayed on same side of thres. 
+    diff_mat = stack([keys_union[curr_comp[i]] .- keys_union[prev_comp[i]] for i in 1:pop_size])
+    # Number of switching particles in each dimension.
+    switch_vec = vec(sum(abs, diff_mat; dims=2))
+    # Net flow from <thres to >thres.
+    net_vec = vec(sum(diff_mat; dims=2))
+    # p-value of binomial test on each dimension, null hypothesis is #(positive switches) ~ Bin(#(switches), 1/2).
+    binoms = Binomial.(switch_vec, 0.5);
+    pvals = [min(1., 2cdf(binom, (switch-abs(net))÷2)) for (switch, net, binom) in zip(switch_vec, net_vec, binoms)]
+    # Switches are dependent across dimensions, use randomization to find critical value under null hypothesis.
+    bootstrap_pmins = Float64[]
+    D, N = size(diff_mat)
+    cache = Vector{Int}(undef, D);
+    rand_bits = BitVector(undef, N);
+    cdf_cache = [Dict{Int,Float64}() for _ in 1:D];
+    @elapsed for _ in 1:n_rand
+        for j in 1:D
+            cache[j] = 0
+        end
+        rand!(rng, rand_bits)
+        for i in 1:N
+            sgn = rand_bits[i] ? 1 : -1
+            for j in 1:D
+                cache[j] += sgn*diff_mat[j,i]
+            end
+        end
+        pmin = 1.0
+        @inbounds for j in 1:D
+            k = (switch_vec[j] - abs(cache[j])) ÷ 2
+            cdf_lookup = cdf_cache[j]
+            p = get!(cdf_lookup, k) do
+                min(1.0, 2cdf(binoms[j], k))
+            end
+            pmin = min(pmin, p)
+        end
+        push!(bootstrap_pmins, pmin)
+    end
+    overall_pval = mean(minimum(pvals) .>= bootstrap_pmins)
+    reject = overall_pval < α
 
-init_dists = begin
-    mix_prior = MixtureModel([slab_seq[1], spike_seq[1]])
-    [
-        fill(slab_prior, length(std_idxs));
-        fill(mix_prior,  length(ss_idxs));
-        noise_prior
-    ];
+    if verbose > 0
+        # pvals_str = string(round.(pvals; digits=4))
+        @info "Pass $npass" reject minimum(pvals) overall_pval string(switch_vec) string(net_vec)
+    end
+
+    return reject ? init_n_nuts : 0
 end
-init_sampler = (rng) -> rand.(Ref(rng), init_dists);
 
-final_ss_prior = MixtureModel([slab_prior, spike_prior])
-final_dists = [
-    fill(slab_prior, length(std_idxs));
-    fill(final_ss_prior, length(ss_idxs));
-    noise_prior
-]
-final_logprior_func(θ) = sum(logpdf(dist, val) for (dist, val) in zip(final_dists, θ))
 
-β_thres_zero(j) = 0.
+## Fisher-Rao path
+mutable struct FRPriorPath{F0,F1,G}
+    init_ss_logprior::F0
+    final_ss_logprior::F1
+    ϕ::Float64 # acos(BC)
+    add_logprior::G
+    prev_u::Float64
+    prev_β::Float64
+    prev_iter::Int
+end
 
-# pop_size = 1000; target_ess = 800; init_pop_size = 1000;
-pop_size = 5000; target_ess = 4000; init_pop_size = 5000;
+function compute_u(p::FRPriorPath, β)
+    β <= p.prev_β && return p.prev_u
+    iter_left = β == 1. ? 1 : (1 - p.prev_β) / (β - p.prev_β) # avoid division by zero
+    u = (p.prev_iter + 1) / (p.prev_iter + iter_left)
+    return max(u, p.prev_u)
+end
 
-fname = joinpath(@__DIR__, "output/data$(dir_idx)/$(run_str).jld2");
-# vid_path = joinpath(@__DIR__, "imgs/$(run_str)/data$(dir_idx)");
-# mkpath(vid_path)
-run_SMC(
-    pop_size, target_ess, init_sampler, logprior_funcs, ldp_builder, move_func, rerun_func, fname;
-    init_stepsize=1e-1, init_pop_size=init_pop_size,
-    β_thres_func=β_thres_zero, verbose=1, #vid_path=vid_path, make_fig=make_fig,
-    parallel=true, pbar_lines=20,
-);
+function FR_logprior(p::FRPriorPath, θ, β)
+    logp_init = p.init_ss_logprior(θ)
+    logp_final = p.final_ss_logprior(θ)
+    u = compute_u(p, β)
+    try
+        logp = 2 * (logaddexp(log(sin((1-u)*p.ϕ)) + logp_init / 2, log(sin(u*p.ϕ)) + logp_final / 2) - log(sin(p.ϕ))) 
+    catch e
+        @info "FR error" u p.prev_u β p.prev_β p.prev_iter
+        flush(stdout)
+        rethrow()
+    end
+end
+
+function update!(p::FRPriorPath, curr_β, iter)
+    u = compute_u(p, curr_β)
+    @info "Iter $iter prior schedule" p.prev_u u
+    p.prev_u = u
+    p.prev_β = curr_β
+    p.prev_iter = iter
+end
+
+(p::FRPriorPath)(θ, β) = FR_logprior(p, θ, β) + p.add_logprior(θ)
+
+# Prior on non spike-and-slab parameters
+function add_logprior(θ)
+    lp = 0.0
+    @inbounds for i in std_idxs
+        lp += logpdf(slab_prior, θ[i])
+    end
+    lp += logpdf(noise_prior, θ[noise_idx])
+    return lp
+end

@@ -18,7 +18,7 @@ struct SMCParticle
 end
 
 
-function nuts_move(rng, particle, target; n_nuts=5, adapt_stepsize_func=adapt_using_curr)
+function nuts_move(rng, particle, target, n_nuts; adapt_stepsize_func=adapt_using_curr)
     metric = DiagEuclideanMetric(LogDensityProblems.dimension(target))
     h = Hamiltonian(metric, target, ForwardDiff)
 
@@ -31,15 +31,19 @@ function nuts_move(rng, particle, target; n_nuts=5, adapt_stepsize_func=adapt_us
     if particle.n_nuts == 0
         sum_sqjdist = 0.
         sum_acc_rate = 0.
-        delta = θs[end] .- particle.state
     else
         sum_sqjdist = particle.info.esjd * particle.n_nuts
         sum_acc_rate = particle.info.agg_acc_rate * particle.n_nuts
-        delta = particle.info.delta .+ θs[end] .- particle.state
     end
+    delta = θs[end] .- particle.state
 
     agg_n_nuts = particle.n_nuts + n_nuts
-    acc_rate_incr = sum(map(s -> s.acceptance_rate, stats))
+    acc_rate_incr = sum(
+        begin
+            a = s.acceptance_rate
+            isfinite(a) ? a : 0.
+        end for s in stats
+    )
     sum_acc_rate += acc_rate_incr
     sum_sqjdist += sum(abs2, θs[1] .- particle.state)
     for i in 2:n_nuts
@@ -63,35 +67,153 @@ function nuts_move(rng, particle, target; n_nuts=5, adapt_stepsize_func=adapt_us
     return SMCParticle(θs[end], NaN, isfinite(logtarget) ? logtarget : -Inf, stepsize, agg_n_nuts, info)
 end
 
+struct PolyakRuppertAveraging{T<:NesterovDualAveraging} <: StepSizeAdaptor
+    inner::T
+end
+PolyakRuppertAveraging(args...) = PolyakRuppertAveraging(NesterovDualAveraging(args...))
+
+AdvancedHMC.getϵ(a::PolyakRuppertAveraging) = exp.(a.inner.state.x_bar)
+AdvancedHMC.adapt!(a::PolyakRuppertAveraging, θ, α) = AdvancedHMC.adapt!(a.inner, θ, α)
+AdvancedHMC.reset!(a::PolyakRuppertAveraging) = (AdvancedHMC.reset!(a.inner); a)
+AdvancedHMC.finalize!(a::PolyakRuppertAveraging) = (AdvancedHMC.finalize!(a.inner); a)
+
+function nuts_PRA_move(rng, particle, target, n_nuts; adapt_stepsize_func=no_adapt_func)
+    metric = DiagEuclideanMetric(LogDensityProblems.dimension(target))
+    h = Hamiltonian(metric, target, ForwardDiff)
+
+    stepsize = particle.stepsize
+    integrator = Leapfrog(stepsize)
+    κ = HMCKernel(Trajectory{MultinomialTS}(integrator, GeneralisedNoUTurn()))
+
+    pra = particle.n_nuts > 0 ? PolyakRuppertAveraging(0.05, 10., 0.75, 0.8, particle.info.das) : PolyakRuppertAveraging(0.8, stepsize)
+
+    θs, stats = sample(rng, h, κ, particle.state, n_nuts, pra, n_nuts, verbose=false)
+
+    if particle.n_nuts == 0
+        sum_sqjdist = 0.
+        sum_acc_rate = 0.
+    else
+        sum_sqjdist = particle.info.esjd * particle.n_nuts
+        sum_acc_rate = particle.info.agg_acc_rate * particle.n_nuts
+    end
+    delta = θs[end] .- particle.state
+
+    agg_n_nuts = particle.n_nuts + n_nuts
+    acc_rate_incr = sum(
+        begin
+            a = s.acceptance_rate
+            isfinite(a) ? a : 0.
+        end for s in stats
+    )
+    sum_acc_rate += acc_rate_incr
+    sum_sqjdist += sum(abs2, θs[1] .- particle.state)
+    for i in 2:n_nuts
+        sum_sqjdist += sum(abs2, θs[i] .- θs[i-1])
+    end
+
+    info = (
+        curr_acc_rate = acc_rate_incr / n_nuts,
+        agg_acc_rate = sum_acc_rate / agg_n_nuts,
+        esjd = sum_sqjdist / agg_n_nuts,
+        delta = delta,
+        das = pra.inner.state
+    )
+    
+    logtarget = stats[end].log_density
+
+    return SMCParticle(θs[end], NaN, isfinite(logtarget) ? logtarget : -Inf, AdvancedHMC.getϵ(pra), agg_n_nuts, info)
+end
+
+function nuts_NDA_move(rng, particle, target, n_nuts; adapt_stepsize_func=no_adapt_func)
+    metric = DiagEuclideanMetric(LogDensityProblems.dimension(target))
+    h = Hamiltonian(metric, target, ForwardDiff)
+
+    stepsize = particle.stepsize
+    integrator = Leapfrog(stepsize)
+    κ = HMCKernel(Trajectory{MultinomialTS}(integrator, GeneralisedNoUTurn()))
+
+    nda = particle.n_nuts > 0 ? NesterovDualAveraging(0.05, 10., 0.75, 0.8, particle.info.das) : NesterovDualAveraging(0.8, stepsize)
+
+    θs, stats = sample(rng, h, κ, particle.state, n_nuts, nda, n_nuts, verbose=false)
+
+    if particle.n_nuts == 0
+        sum_sqjdist = 0.
+        sum_acc_rate = 0.
+    else
+        sum_sqjdist = particle.info.esjd * particle.n_nuts
+        sum_acc_rate = particle.info.agg_acc_rate * particle.n_nuts
+    end
+    delta = θs[end] .- particle.state
+
+    agg_n_nuts = particle.n_nuts + n_nuts
+    acc_rate_incr = sum(
+        begin
+            a = s.acceptance_rate
+            isfinite(a) ? a : 0.
+        end for s in stats
+    )
+    sum_acc_rate += acc_rate_incr
+    sum_sqjdist += sum(abs2, θs[1] .- particle.state)
+    for i in 2:n_nuts
+        sum_sqjdist += sum(abs2, θs[i] .- θs[i-1])
+    end
+
+    info = (
+        curr_acc_rate = acc_rate_incr / n_nuts,
+        agg_acc_rate = sum_acc_rate / agg_n_nuts,
+        esjd = sum_sqjdist / agg_n_nuts,
+        delta = delta,
+        das = nda.state
+    )
+    
+    logtarget = stats[end].log_density
+
+    return SMCParticle(θs[end], NaN, isfinite(logtarget) ? logtarget : -Inf, exp(nda.state.x_bar), agg_n_nuts, info)
+end
+
 no_adapt_func(info) = 1.
 adapt_using_agg(info) = 1.5^((info.agg_acc_rate-0.8)/0.2)
 adapt_using_curr(info) = 1.5^((info.curr_acc_rate-0.8)/0.2)
 
 
 function perform_moves!(
-    particles, target, move_func, rerun_func!, states_before_move,
+    particles, target, move_func, n_nuts_func, states_before_move,
     iter, targetinfo, rngs;
     max_npass, pop_size, pbar_lines, parallel, verbose
 )
     npass = 0
     move_time = 0.0
+    last_n_nuts = nothing
     while npass < max_npass
+        n_nuts = n_nuts_func(particles, last_n_nuts, npass, states_before_move; verbose, rng = rngs[1])
+        n_nuts == 0 && break
+
         npass += 1
+        last_n_nuts = n_nuts
+
         pbar = Progress(pop_size; desc="Iter $iter, pass $(npass)")
+        pbar_step = max(1, pop_size ÷ pbar_lines)
         if parallel
             counter = Threads.Atomic{Int}(0)
+            pbar_lock = Threads.SpinLock()
             targets = [customcopy(target) for _ in 1:pop_size]
             thread_times = zeros(Threads.nthreads())
-            GC.gc(false)            
+            GC.gc(false)
 
-            Threads.@threads for i in 1:pop_size
+            Threads.@threads :static for i in 1:pop_size
                 particle = particles[i]
-                thread_times[Threads.threadid()] += @elapsed particles[i] = move_func(rngs[Threads.threadid()], particle, targets[i])
+                tid = Threads.threadid()
+                thread_times[tid] += @elapsed begin
+                    particles[i] = move_func(rngs[tid], particle, targets[i], n_nuts)
+                end
                 prev_done = Threads.atomic_add!(counter, 1)
-                if (prev_done + 1) % (pop_size ÷ pbar_lines) == 0
-                    ProgressMeter.update!(pbar, prev_done + 1)
+                if (prev_done + 1) % pbar_step == 0
+                    lock(pbar_lock) do
+                        ProgressMeter.update!(pbar, prev_done + 1)
+                    end
                 end
             end
+
             if verbose > 1
                 display(thread_times)
             end
@@ -100,18 +222,16 @@ function perform_moves!(
             rng = rngs[1]
             for i in 1:pop_size
                 particle = particles[i]
-                move_time += @elapsed particles[i] = move_func(rng, particle, target)
-                if i % (pop_size ÷ pbar_lines) == 0
+                move_time += @elapsed particles[i] = move_func(rng, particle, target, n_nuts)
+                if i % pbar_step == 0
                     ProgressMeter.update!(pbar, i)
                 end
             end
         end
         ProgressMeter.finish!(pbar)
-        rerun_func!(particles, states_before_move, iter, npass, targetinfo; verbose) || break
     end
     return npass, move_time
 end
-
 
 
 # Runs one SMC iteration: reweight → resample → move.
@@ -120,8 +240,8 @@ end
 function SMC_iteration!(
     iter, pop_size, target_ess,
     all_particles, targetinfos, npass_vec, figs, smc_times,
-    logprior_funcs, ldp_builder, move_func, rerun_func!, fname, rngs; 
-    max_npass=10, β_thres_func=(j)->1e-2,
+    logprior_func, ldp_builder, move_func, n_nuts_func, fname, rngs; 
+    max_npass=10,
     parallel=false, pbar_lines=pop_size, vid_path=nothing, make_fig=nothing, verbose=0
 )
     t_start = time()
@@ -129,17 +249,17 @@ function SMC_iteration!(
     # Reweight    
     particles = all_particles[end]
     prev_targetinfo = targetinfos[end]
-    target, targetinfo = build_target_SMC(
-        iter, all_particles, prev_targetinfo, target_ess, logprior_funcs, ldp_builder; 
-        β_thres_func, verbose
+    target, targetinfo = build_target_SMC!(
+        iter, all_particles, prev_targetinfo, target_ess, logprior_func, ldp_builder; 
+        verbose
     )
     if isnothing(target)
         return true
     end
     
     rng = rngs[1]   
-    prior_idx, β = targetinfo
-    push!(targetinfos, targetinfo) 
+    β, = targetinfo
+    push!(targetinfos, targetinfo)
     
     prev_logtarget_vec = getproperty.(particles, :logtarget)
     logtarget_vec = map(p -> LogDensityProblems.logdensity(target, p.state), particles)
@@ -160,21 +280,21 @@ function SMC_iteration!(
     # Move
     smc_time = time() - t_start
     npass, move_time = perform_moves!(
-        particles, target, move_func, rerun_func!, states_before_move,
+        particles, target, move_func, n_nuts_func, states_before_move,
         iter, targetinfo, rngs;
         max_npass, pop_size, pbar_lines, parallel, verbose
     )
     smc_time += move_time
-
-    logprior_func = logprior_funcs[prior_idx]
-    particles = [@set p.loglike = (p.logtarget - logprior_func(p.state)) / β for p in particles]
+    
+    particles = [@set p.loglike = (p.logtarget - logprior_func(p.state, β)) / β for p in particles]
     push!(all_particles, particles)
 
     agg_acc_rate = mean(filter(isfinite, [p.info.agg_acc_rate for p in particles]))
     median_esjd = median([p.info.esjd for p in particles])
 
     if verbose > 0
-        @info "Iter $iter post-MCMC" agg_acc_rate median_esjd
+        total_n_nuts = particles[1].n_nuts
+        @info "Iter $iter post-MCMC" total_n_nuts agg_acc_rate median_esjd
         flush(stdout)
         flush(stderr)
     end    
@@ -194,66 +314,50 @@ function SMC_iteration!(
 end
 
 
-function build_target_SMC(
-    iter, all_particles, prev_targetinfo, target_ess, logprior_funcs, ldp_builder; 
-    verbose=0, min_β=1e-8, β_thres_func=(j)->1e-2
+function build_target_SMC!(
+    iter, all_particles, prev_targetinfo, target_ess, logprior_func, ldp_builder; 
+    verbose=0, Δβ=1e-8,
 )
-    n_priors = length(logprior_funcs)
-    # tot_pop_size = sum(length, all_particles)
-    prev_prior_idx, prev_β = prev_targetinfo
+    prev_β, = prev_targetinfo
     particles = all_particles[end]
 
     @assert iter > 0    
 
-    if prev_prior_idx == n_priors && prev_β >= 1 - min_β
+    if prev_β >= 1.0
         return (nothing, nothing)
     end
-    
-    # Prior tempering
-    β_thres = β_thres_func(prev_prior_idx)
-    curr_prior_idx = min(n_priors, prev_β >= β_thres ? prev_prior_idx + 1 : prev_prior_idx)
-    logprior_func = logprior_funcs[curr_prior_idx]
 
-    # Likelihood tempering
-    prev_logtargets = getproperty.(particles, :logtarget)
-    logpriors = logprior_func.(getproperty.(particles, :state))
+    # Tempering
+    states = getproperty.(particles, :state)
     loglikes = getproperty.(particles, :loglike)
-
-    logws = logpriors .+ prev_β .* loglikes .- prev_logtargets
-    prev_ess = compute_ess(logws)
-    # if !isfinite(prev_ess)
-    #     display(extrema(logpriors))
-    #     display(extrema(loglikes))
-    #     display(extrema(prev_logtargets))
-    #     @assert isfinite(prev_ess)
-    # end
-
-    if (prev_ess < target_ess) && (curr_prior_idx > prev_prior_idx)
-        curr_prior_idx -= 1
-        logprior_func = logprior_funcs[curr_prior_idx]
-        logpriors = logprior_func.(getproperty.(particles, :state))
-        logws = logpriors .+ prev_β .* loglikes .- prev_logtargets
-        prev_ess = compute_ess(logws)
+    prev_logtargets = getproperty.(particles, :logtarget)
+    
+    ess_final = compute_ess(logprior_func.(states, 1.) .+ loglikes .- prev_logtargets)
+    if ess_final >= target_ess
+        curr_β = 1.
+    else
+        curr_β = IVT_search(
+            target_ess, 
+            (β) -> compute_ess(logprior_func.(states, β) .+ β .* loglikes .- prev_logtargets), 
+            max(Δβ, prev_β), 1.; tol=Δβ,
+        )
     end
-    curr_β = bisection_search(
-        target_ess, 
-        (β) -> compute_ess(logpriors .+ β .* loglikes .- prev_logtargets), 
-        max(min_β, prev_β), 1.; tol=min_β, is_increasing=false
-    )
+    update!(logprior_func, curr_β, iter)
+    curr_ess = compute_ess(logprior_func.(states, curr_β) .+ curr_β .* loglikes .- prev_logtargets)
 
     if verbose > 0
-        @info "Iter $iter tempering" curr_prior_idx curr_β prev_ess
+        @info "Iter $iter tempering" curr_β curr_ess
         flush(stdout)
         flush(stderr)
     end
 
-    return (ldp_builder(logprior_func, curr_β), (curr_prior_idx, curr_β))
+    return (ldp_builder(logprior_func, curr_β), (curr_β,))
 end
 
 function run_SMC(
-    pop_size, target_ess, init_sampler, logprior_funcs, ldp_builder, move_func, rerun_func!, fname;
+    pop_size, target_ess, init_sampler, logprior_func, ldp_builder, move_func, n_nuts_func, fname;
     init_pop_size=pop_size, init_stepsize::Float64=0.01, 
-    max_npass=10, β_thres_func=(j)->1e-2,
+    max_npass=10,
     verbose=0, vid_path=nothing, make_fig=nothing,
     parallel=false, pbar_lines=pop_size, rng=Random.default_rng()
 )
@@ -265,16 +369,25 @@ function run_SMC(
     initstates = [init_sampler(rng) for _ in 1:init_pop_size] 
 
     iter = 0
-    init_logprior_func = logprior_funcs[1]
-    logpriors = init_logprior_func.(initstates)
-    tmp_target = ldp_builder(init_logprior_func, 1.) # use β = 1 to extract likelihood
+    logpriors = logprior_func.(initstates, 0.)
+
+    # use β = 1 to extract likelihood
+    tmp_target = ldp_builder(logprior_func, 1.) 
+    tmp_logpriors = logprior_func.(initstates, 1.)
+    tmp_loglikes = LogDensityProblems.logdensity.(Ref(tmp_target), initstates) .- tmp_logpriors
+
+    # finite_loglikes = filter(isfinite, tmp_loglikes)
+    # finite_tmp_logpriors = filter(isfinite, tmp_logpriors)
+    # @info "Initial finite checks" length(finite_loglikes) length(finite_tmp_logpriors)
+    flush(stdout)
+
     all_particles = [SMCParticle.(
         initstates,
-        LogDensityProblems.logdensity.(Ref(tmp_target), initstates) .- logpriors,
+        tmp_loglikes,
         logpriors, # actual logtarget has β = 0
         init_stepsize, 0, Ref(NamedTuple())
     )]
-    targetinfos = [(1, 0.)]
+    targetinfos = [(0.,)]
     npass_vec, smc_times = Int64[], Float64[]
 
     figs = Figure[]
@@ -287,8 +400,8 @@ function run_SMC(
         SMC_done = SMC_iteration!(
             iter, pop_size, target_ess,
             all_particles, targetinfos, npass_vec, figs, smc_times,
-            logprior_funcs, ldp_builder, move_func, rerun_func!, fname, rngs;
-            max_npass, β_thres_func, parallel, pbar_lines, vid_path, make_fig, verbose
+            logprior_func, ldp_builder, move_func, n_nuts_func, fname, rngs;
+            max_npass, parallel, pbar_lines, vid_path, make_fig, verbose
         )
         SMC_done && break
     end
@@ -305,8 +418,8 @@ end
 
 # Resumes a run_SMC that was interrupted, reading state from `fname``.
 function resume_SMC(
-    pop_size, target_ess, logprior_funcs, ldp_builder, move_func, rerun_func!, fname;
-    max_npass=10, β_thres_func=(j)->1e-2,
+    pop_size, target_ess, logprior_func, ldp_builder, move_func, n_nuts_func, fname;
+    max_npass=10,
     verbose=0, vid_path=nothing, make_fig=nothing, 
     parallel=false, pbar_lines=pop_size, rng=Random.default_rng()
 )
@@ -333,8 +446,8 @@ function resume_SMC(
         SMC_done = SMC_iteration!(
             iter, pop_size, target_ess,
             all_particles, targetinfos, npass_vec, figs, smc_times,
-            logprior_funcs, ldp_builder, move_func, rerun_func!, fname, rngs;
-            max_npass, β_thres_func, parallel, pbar_lines, vid_path, make_fig, verbose
+            logprior_func, ldp_builder, move_func, n_nuts_func, fname, rngs;
+            max_npass, parallel, pbar_lines, vid_path, make_fig, verbose
         )
         SMC_done && break
     end
@@ -349,283 +462,127 @@ function resume_SMC(
 end
 
 
-## Deprecated
-# struct PSParticle
-#     state::AbstractVector{Float64}
-#     loglike::Float64   # log likelihood
-#     logtarget::Float64 # log target density
-#     stepsize::Float64  # NUTS step size
-#     n_nuts::Int64      # number of NUTS iterations
-#     info::NamedTuple
-# end
+# Functions for processing SMC output
 
+function load_SMC(fname)
+    @load fname all_particles iter targetinfos npass_vec smc_times
+    return all_particles, iter, targetinfos, npass_vec, smc_times
+end
 
-# Runs one PS iteration: reweight → resample → move.
-# Modifies all_particles, all_dtors, logZs, targetinfos, npass_vec, figs, smc_times.
-# Returns whether to terminate PS.
-function PS_iteration!(
-    iter, pop_size, target_ess,
-    all_particles, all_dtors, logZs, targetinfos, npass_vec, figs, smc_times,
-    logprior_funcs, ldp_builder, move_func, rerun_func!, fname, rngs; 
-    max_npass=10, β_thres_func=(j)->1e-2,
-    parallel=false, pbar_lines=pop_size, vid_path=nothing, make_fig=nothing, verbose=0
-)
-    t_start = time()
+function partition_by_thres(states::AbstractVector, thres::Float64)
+    classes = Dict{BitVector, Vector{Int}}()
+    for (i, θ) in enumerate(states)
+        mask = BitVector(θ[j] > thres for j in ss_idxs)
+        push!(get!(classes, mask, Int[]), i)
+    end
+    return classes
+end
 
-    # Compute densities of all samples under each target so far, weighted by population size
-    pop_sizes = length.(all_particles)
-    prev_prior_idx, prev_β = prev_targetinfo = targetinfos[end]
-    prev_logprior_func = logprior_funcs[prev_prior_idx]
-    prev_logZ = logZs[end]
-    prev_pop_size = pop_sizes[end]
-    for t in 1:iter
-        states = getproperty.(all_particles[t], :state)
-        loglikes = getproperty.(all_particles[t], :loglike)
-        if t == iter # evaluate latest population for all targets
-            push!(all_dtors, [
-                logsumexp([
-                    begin
-                        prior_idx_s, β_s = targetinfos[s]
-                        logprior_funcs[prior_idx_s](state) + β_s*loglike - logZs[s] + log(pop_sizes[s])
-                    end for s in 1:iter
-                ]) for (state, loglike) in zip(states, loglikes)
-            ])
-        else # evaluate earlier populations for latest target
-            new_terms = prev_logprior_func.(states) .+ prev_β .* loglikes .- prev_logZ .+ log(prev_pop_size)
-            all_dtors[t] .= logaddexp.(all_dtors[t], new_terms)
+function get_mode_probs(states, thres, Ws=ones(length(states)))
+    lookup = zeros(Int, 2^n_ss)
+    for (i, elems) in enumerate(combinations(1:n_ss))
+        idx = 0
+        for elem in elems
+            idx |= (1 << (elem - 1))
         end
-    end    
-    
-    target, targetinfo, all_logws = build_target_PS(iter, all_particles, all_dtors, prev_targetinfo, target_ess, logprior_funcs, ldp_builder; β_thres_func, verbose)
-    
-    # Reweight
-    cat_logws = reduce(vcat, all_logws)
-    @assert !any(isnan, cat_logws)
-    if isnothing(target)
-        iter -= 1
-        @save fname all_particles all_dtors all_logws logZs iter targetinfos npass_vec smc_times
-        return true
+        lookup[idx + 1] = i
     end
-    push!(logZs, logsumexp(cat_logws) - log(length(cat_logws)))
-    rng = rngs[1]
-    prior_idx, β = targetinfo
-    push!(targetinfos, targetinfo)
 
-    # Resample
-    cat_ws = exp.(cat_logws .- maximum(cat_logws))
-    sampled_idxs = stratified_sampling(cat_ws, pop_size; rng=rng)
-    states_before_move = getproperty.(reduce(vcat, all_particles)[sampled_idxs], :state)
+    counts = zeros(2^n_ss)
+    for (state, W) in zip(states, Ws)
+        idx = 0
+        for j in 1:n_ss
+            if state[ss_idxs[j]] > thres
+                idx |= (1 << (j - 1))
+            end
+        end
+        counts[lookup[idx + 1]] += W
+    end
+    return counts ./ sum(Ws)
+end
 
-    # Lookup particle-specific step size and acceptance rate, and reset number of NUTS iterations
-    prev_btree = BallTree(stack(p.state for p in all_particles[end]))
-    lookup, _ = nn(prev_btree, stack(states_before_move))
-    particles = [
-        SMCParticle(state, NaN, NaN, p_lookup.stepsize, 0, NamedTuple())
-        for (state, p_lookup) in zip(states_before_move, all_particles[end][lookup])
-    ]
+function get_mode_probs_all(states, prob_func, Ws=ones(length(states)))
+    lookup = zeros(Int, 2^n_ss)
+    for (i, elems) in enumerate(combinations(1:n_ss))
+        idx = 0
+        for elem in elems
+            idx |= (1 << (elem - 1))
+        end
+        lookup[idx + 1] = i
+    end
 
-    # Move
-    smc_time = time() - t_start
-    npass, move_time = perform_moves!(
-        particles, target, move_func, rerun_func!, states_before_move,
-        iter, targetinfo, rngs;
-        max_npass, pop_size, pbar_lines, parallel, verbose
+    probs = zeros(2^n_ss)
+    @showprogress for (state, W) in zip(states, Ws)
+        for idx in 1:(2^n_ss)
+            p = 1.
+            for j in 1:n_ss
+                p_factor = prob_func(state[ss_idxs[j]])
+                incl_j = isodd((idx-1) >> (j-1))
+                p *= incl_j ? p_factor : (1- p_factor)
+            end
+            probs[lookup[idx]] += p*W
+        end        
+    end
+    return probs ./ sum(Ws)
+end 
+
+function get_pvec(particles, thres, Ws=ones(length(particles)))
+    return get_mode_probs(getproperty.(particles, :state), thres, Ws)
+end
+
+function make_fig(particles, iter, ss_idxs, ps)
+    pop_size = length(particles)
+    f = plot_pairs(
+        getproperty.(particles, :state);
+        title="Iteration $iter",
+        figsize=(1000, 1000), skip_upper=true,
+        axis_kwargs=(;), hist_axis_kwargs=(; yscale=identity),
+        scatter_kwargs=(; markersize=4, alpha=clamp(1000 / pop_size * 0.3, 0.01, 0.5)),
+        hist_kwargs=(bins=50,),
     )
-    smc_time += move_time
+    Box(f[ss_idxs, ss_idxs], color=(:green, 0.2), strokevisible=false)
 
-    logprior_func = logprior_funcs[prior_idx]
-    particles = [@set p.loglike = (p.logtarget - logprior_func(p.state)) / β for p in particles]
-    push!(all_particles, particles)
-
-    agg_acc_rate = mean(filter(isfinite, [p.info.agg_acc_rate for p in particles]))
-    median_esjd = median([p.info.esjd for p in particles])
-
-    if verbose > 0 
-        @info "Iter $iter post-MCMC" agg_acc_rate median_esjd logZs[end]
-        flush(stdout)
-        flush(stderr)
-    end    
-
-    fig = nothing
-    if !isnothing(vid_path)
-        fig = make_fig(particles, iter)
-        save(joinpath(vid_path, "iter$(iter).png"), fig, px_per_unit=4)
-        push!(figs, fig)
+    d = length(ps)
+    idx = 0
+    for (i1, p1) in enumerate(ps) # which row
+        for (i2, p2) in enumerate(ps) # which column
+            if i1 < i2
+                continue
+            end
+            idx += 1
+            ax = f.content[idx]
+            if i1 == i2
+                ax.yaxisposition = :right
+                ax.yticklabelsize = 14
+                ax.yticklabelpad = 0.5
+                ax.yticksvisible = true
+                ax.yticklabelsvisible = true
+            elseif i2 ∈ [1, d]
+                ax.yaxisposition = i2 == 1 ? :left : :right
+                ax.ylabel = L"\log_{10} %$(sym2label[Symbol(p1)])"
+                ax.ylabelsize = 18
+                ax.yticks = WilkinsonTicks(6; k_min = 3, k_max=6)
+                ax.yticklabelsize = 14
+                ax.yticksvisible = true
+                ax.yticklabelsvisible = true                
+            else
+                ax.yticksvisible = false
+                ax.yticklabelsvisible = false
+            end
+            
+            if i1 ∈ [d]
+                ax.xaxisposition = i1 == 1 ? :top : :bottom
+                ax.xlabel = L"\log_{10} %$(sym2label[Symbol(p2)])"
+                ax.xlabelsize = 18
+                ax.xticks = WilkinsonTicks(6; k_min = 3, k_max=6)
+                ax.xticklabelrotation = π/4
+                ax.xticklabelsize = 14
+            else
+                ax.xticksvisible = false
+                ax.xticklabelsvisible = false
+            end
+        end
     end
-    push!(npass_vec, npass)
-    push!(smc_times, smc_time)
-
-    @save fname all_particles all_dtors all_logws logZs iter targetinfos npass_vec smc_times
-
-    return false
-end
-
-
-function build_target_PS(
-    iter, all_particles, all_dtors, prev_targetinfo, target_ess, logprior_funcs, ldp_builder; 
-    verbose=0, min_β=1e-8, β_thres_func=(j)->1e-2
-)
-    n_priors = length(logprior_funcs)
-    tot_pop_size = sum(length, all_particles)
-    prev_prior_idx, prev_β = prev_targetinfo
-
-    @assert length(all_dtors) == length(all_particles)
-    @assert iter > 0    
-
-    if prev_prior_idx == n_priors && prev_β >= 1 - min_β
-        logprior_func = logprior_funcs[prev_prior_idx]
-        all_logws = [
-            begin
-                ntors = logprior_func.(getproperty.(particles, :state)) .+ prev_β .* getproperty.(particles, :loglike)
-                tmp_logws = ntors .- (dtors .- log(tot_pop_size))
-                tmp_logws[.!isfinite.(tmp_logws)] .= -Inf
-                tmp_logws
-            end for (dtors, particles) in zip(all_dtors, all_particles)
-        ]
-        return (nothing, nothing, all_logws)
-    end
-    
-    # Prior tempering
-    β_thres = β_thres_func(prev_prior_idx)
-    curr_prior_idx = min(n_priors, prev_β >= β_thres ? prev_prior_idx + 1 : prev_prior_idx)
-    logprior_func = logprior_funcs[curr_prior_idx]
-
-    # Likelihood tempering
-    cat_logpriors = logprior_func.([p.state for ps in all_particles for p in ps])
-    cat_loglikes = [p.loglike for ps in all_particles for p in ps]
-    cat_dtors = reduce(vcat, all_dtors) .- log(tot_pop_size)
-
-    prev_ess = compute_ess(cat_logpriors .+ prev_β .* cat_loglikes .- cat_dtors)
-    # if !isfinite(prev_ess)
-    #     display(extrema(cat_logpriors))
-    #     display(extrema(cat_loglikes))
-    #     display(extrema(cat_dtors))
-    #     @assert isfinite(prev_ess)
-    # end
-
-    if (prev_ess < target_ess) && (curr_prior_idx > prev_prior_idx)
-        curr_prior_idx -= 1
-        logprior_func = logprior_funcs[curr_prior_idx]
-        cat_logpriors = logprior_func.([p.state for ps in all_particles for p in ps])
-        cat_loglikes = [p.loglike for ps in all_particles for p in ps]
-        cat_dtors = reduce(vcat, all_dtors) .- log(tot_pop_size)
-        prev_ess = compute_ess(cat_logpriors .+ cat_loglikes .* prev_β .- cat_dtors)
-    end
-    curr_β = bisection_search(
-        target_ess, 
-        (β) -> compute_ess(cat_logpriors .+ cat_loglikes .* β .- cat_dtors), 
-        max(min_β, prev_β), 1.; tol=min_β, is_increasing=false
-    )
-
-    if verbose > 0
-        @info "Iter $iter tempering" curr_prior_idx curr_β prev_ess
-        flush(stdout)
-        flush(stderr)
-    end
-
-    all_logws = [
-        begin
-            ntors = logprior_func.(getproperty.(particles, :state)) .+ curr_β .* getproperty.(particles, :loglike)
-            tmp_logws = ntors .- (dtors .- log(tot_pop_size))
-            tmp_logws[.!isfinite.(tmp_logws)] .= -Inf
-            tmp_logws
-        end for (dtors, particles) in zip(all_dtors, all_particles)
-    ]
-
-    return (ldp_builder(logprior_func, curr_β), (curr_prior_idx, curr_β), all_logws)
-end
-
-function run_PS(
-    pop_size, target_ess, init_sampler, logprior_funcs, ldp_builder, move_func, rerun_func!, fname;
-    init_pop_size=pop_size, init_stepsize::Float64=0.01, 
-    max_npass=10, β_thres_func=(j)->1e-2,
-    verbose=0, vid_path=nothing, make_fig=nothing,
-    parallel=false, pbar_lines=pop_size, rng=Random.default_rng()
-)
-    if parallel
-        rngs = [StableRNG(rand(rng, UInt64)) for _ in 1:Threads.nthreads()]
-    else
-        rngs = [rng]
-    end
-    initstates = [init_sampler(rng) for _ in 1:init_pop_size] 
-
-    iter = 0
-    init_logprior_func = logprior_funcs[1]
-    logpriors = init_logprior_func.(initstates)
-    tmp_target = ldp_builder(init_logprior_func, 1.) # use β = 1 to extract likelihood
-    all_particles = [SMCParticle.(
-        initstates,
-        LogDensityProblems.logdensity.(Ref(tmp_target), initstates) .- logpriors,
-        logpriors, # actual logtarget has β = 0
-        init_stepsize, 0, Ref(NamedTuple())
-    )]
-    targetinfos = [(1, 0.)]
-    all_dtors = Vector{Float64}[]
-    logZs = [0.]
-    npass_vec, smc_times = Int64[], Float64[]
-
-    figs = Figure[]
-    if !isnothing(vid_path)
-        mkpath(vid_path)
-    end
-
-    while true
-        iter += 1
-        PS_done = PS_iteration!(
-            iter, pop_size, target_ess,
-            all_particles, all_dtors, logZs, targetinfos, npass_vec, figs, smc_times,
-            logprior_funcs, ldp_builder, move_func, rerun_func!, fname, rngs;
-            max_npass, β_thres_func, parallel, pbar_lines, vid_path, make_fig, verbose
-        )
-        PS_done && break
-    end
-
-    if !isnothing(vid_path)
-        VideoIO.save(
-            joinpath(vid_path, "iters.mp4"),
-            [CairoMakie.Colors.RGB.(colorbuffer(fig)) for fig in figs],
-            framerate=3, encoder_options=(crf=23, preset="medium")
-        )
-    end
-end
-
-
-# Resumes a run_PS that was interrupted, reading state from `fname``.
-function resume_PS(
-    pop_size, target_ess, logprior_funcs, ldp_builder, move_func, rerun_func!, fname;
-    max_npass=10, β_thres_func=(j)->1e-2,
-    verbose=0, vid_path=nothing, make_fig=nothing, parallel=false, pbar_lines=pop_size
-)
-    @load fname all_particles all_dtors logZs iter targetinfos npass_vec smc_times
-    @assert length(all_particles) == (iter + 1)
-    rngs = parallel ? [Xoshiro() for _ in 1:Threads.nthreads()] : [Random.default_rng()]
-
-    figs = Figure[]
-    if !isnothing(vid_path)
-        mkpath(vid_path)
-        figs = make_fig.(all_particles[2:end], 1:iter)   
-    end
-
-    @info "Resuming PS by loading iter $iter"
-    flush(stdout)
-    flush(stderr)
-
-    while true
-        iter += 1
-        PS_done = PS_iteration!(
-            iter, pop_size, target_ess,
-            all_particles, all_dtors, logZs, targetinfos, npass_vec, figs, smc_times,
-            logprior_funcs, ldp_builder, move_func, rerun_func!, fname, rngs;
-            max_npass, β_thres_func, parallel, pbar_lines, vid_path, make_fig, verbose
-        )
-        PS_done && break
-    end
-
-    if !isnothing(vid_path)
-        VideoIO.save(
-            joinpath(vid_path, "iters.mp4"),
-            [CairoMakie.Colors.RGB.(colorbuffer(fig)) for fig in figs],
-            framerate=3, encoder_options=(crf=23, preset="medium")
-        )
-    end
+    colgap!(f.layout, -8)
+    return f
 end

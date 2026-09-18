@@ -1,5 +1,5 @@
 using LinearAlgebra, LogExpFunctions, MCMCChains
-using Distributions, Random, StatsBase
+using Distributions, QuadGK, Random, StatsBase
 
 
 # Effective sample size
@@ -35,6 +35,25 @@ function bisection_search(trg, func, lo, hi; tol=1e-10, is_increasing = func(hi)
         end
     end
     
+    return right
+end
+
+# Search based on intermediate value theorem
+function IVT_search(trg, func, lo, hi; tol=1e-10)    
+    left, right = lo, hi
+    val_left, val_right = func(left), func(right)
+    @assert (func(hi) - trg) * (func(lo) - trg) <= 0 "trg is not in the range of func"
+    while right - left > tol
+        mid = (left + right) / 2
+        val = func(mid)
+        if (val - trg) * (val_left - trg) > 0
+            left = mid
+            val_left = val
+        else
+            right = mid
+            val_right = val
+        end
+    end    
     return right
 end
 
@@ -107,6 +126,7 @@ LogDensityProblems.capabilities(::Type{<:BasicLDP}) = LogDensityProblems.LogDens
 LogDensityProblems.dimension(ldp::BasicLDP)      = ldp.d
 LogDensityProblems.logdensity(ldp::BasicLDP, x)  = ldp.f(x)
 
+customcopy(ldp::BasicLDP) = BasicLDP(ldp.f, ldp.d)
 
 ## LogDensityProblem for tuple of distributions
 struct PriorLogDensity{V<:AbstractVector{<:UnivariateDistribution}}
@@ -116,3 +136,11 @@ end
 LogDensityProblems.logdensity(p::PriorLogDensity, x) = sum(logpdf(p.dists[i], x[i]) for i in eachindex(p.dists))
 LogDensityProblems.dimension(p::PriorLogDensity) = length(p.dists)
 LogDensityProblems.capabilities(::Type{<:PriorLogDensity}) = LogDensityProblems.LogDensityOrder{0}()
+
+customcopy(p::PriorLogDensity) = PriorLogDensity(p.dists)
+
+
+function compute_BC(d1, d2, lo=-Inf, hi=Inf)
+    f(x) = exp((logpdf(d1, x) + logpdf(d2, x))/2)
+    return quadgk(f, lo, hi)[1]
+end
