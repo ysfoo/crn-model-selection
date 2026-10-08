@@ -211,7 +211,7 @@ counter = Threads.Atomic{Int}(0)
 amis_summary(res) = "logZ $(round(logsumexp(res.value.psis_logws) - log(length(res.value.psis_logws)); digits=4)), khat $(round(res.value.pareto_shape; digits=3))"
 for model_idx in 1:n_models
     fname = joinpath(OUTDIR, "robust_AMIS_model$(model_idx).jld2")
-    # isfile(fname) && continue # TODO: uncomment
+    isfile(fname) && continue # only fit models without an output file
 
     with_model_log(model_idx, counter, n_models; logdir=LOGDIR, summary=amis_summary) do io
         d = nparams[model_idx]

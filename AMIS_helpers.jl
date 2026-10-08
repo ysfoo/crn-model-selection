@@ -115,6 +115,16 @@ end
 # end
 
 
+# True if the precision matrix of covariance `Σ` has a Cholesky factor, computed as in robust AMIS.
+function has_posdef_precision(Σ)
+    try
+        return issuccess(cholesky(inv(hermitianpart(Σ)); check=false))
+    catch e
+        e isa Union{LinearAlgebra.SingularException, PosDefException} || rethrow()
+        return false
+    end
+end
+
 function init_dists(target, prior_sampler, prior_means, prior_vars, nruns, Kmax, logp_thres; 
                     progress=false, rng=Random.default_rng(), io=stdout)
     if progress p = Progress(nruns; dt=1) end
@@ -139,6 +149,12 @@ function init_dists(target, prior_sampler, prior_means, prior_vars, nruns, Kmax,
         i->max_logp - all_logps[i] <= logp_thres && all(diag(all_dists[i].Σ) .< prior_vars) && all(abs.(all_dists[i].μ .- prior_means) .< 4 .* sqrt.(prior_vars)), 
         1:n_all
     )
+    # Drop fits whose precision matrix is numerically not positive definite (ill-conditioned Pathfinder covariances):
+    # robust AMIS builds its mixture from `cholesky(inv(hermitianpart(Σ)))`, which then throws a PosDefException.
+    # This is done before de-duplication, so a nearby well-conditioned fit can take the place of a dropped one.
+    n_cand = length(cand_idxs)
+    filter!(c -> has_posdef_precision(all_dists[c].Σ), cand_idxs)
+    n_cand > length(cand_idxs) && println(io, "Dropped $(n_cand - length(cand_idxs)) of $n_cand Pathfinder fits with a non-positive-definite precision matrix")
     # Dense covariances and their logdets, computed once per candidate (indexed by position in cand_idxs)
     cand_μs = [Vector(all_dists[c].μ) for c in cand_idxs]
     cand_Σs = [Matrix(all_dists[c].Σ) for c in cand_idxs]
