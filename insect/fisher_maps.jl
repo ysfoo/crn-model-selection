@@ -75,7 +75,9 @@ D_affine(s, θ, α) = popvar(s .* α .+ θ ./ s)
 # Parts used for the split start, the flags and the per-part latent scales.
 split_point(k, θ) = k in ss_idxs ? thres : median(θ)
 
-function fit_twoslope(k, θ, α; ζ0=1.0)
+# `λ` adds the penalty λ (log s_high - log s_low)^2 to D (see `penalty_lambda` for its scale); f.D is the unpenalised D at
+# the penalised optimum and f.D_pen the penalised objective.
+function fit_twoslope(k, θ, α; ζ0=1.0, λ=0.0)
     s_glob = nutpie_scale(θ, α)
     cut = split_point(k, θ)
     lo, hi = θ .<= cut, θ .> cut
@@ -93,7 +95,7 @@ function fit_twoslope(k, θ, α; ζ0=1.0)
     isfinite(θs) || (θs = median(θ))
 
     starts = [:split => TwoSlope(θs, slo, shi, ζ0), :affine => TwoSlope(median(θ), s_glob, s_glob, ζ0)]
-    obj(p) = (v = Dk(to_map(p), θ, α); isfinite(v) ? v : Inf)
+    obj(p) = (v = Dk(to_map(p), θ, α) + λ * (p[3] - p[2])^2; isfinite(v) ? v : Inf)
     best = nothing
     for (name, m0) in starts
         p = from_map(m0)
@@ -103,8 +105,8 @@ function fit_twoslope(k, θ, α; ζ0=1.0)
             p = Optim.minimizer(res)
         end
         D = Optim.minimum(res)
-        if isnothing(best) || D < best.D
-            best = (D=D, m=to_map(p), start=name, D_start=obj(from_map(m0)))
+        if isnothing(best) || D < best.D_pen
+            best = (D=Dk(to_map(p), θ, α), D_pen=D, m=to_map(p), start=name, D_start=obj(from_map(m0)))
         end
     end
 
@@ -125,6 +127,14 @@ function fit_twoslope(k, θ, α; ζ0=1.0)
 end
 
 # ---------------------------------------------------------------------------------------------------------------------
+# Scale of the penalty. D is a population average. For a part j holding a fraction w_j of the particles, roughly
+# Gaussian in latent space with its slope off by a factor e^δ_j, D gains about w_j (2 sinh δ_j)^2 ≈ 4 w_j δ_j^2. Forcing a
+# log slope ratio L to equal slopes then costs about 4 w_lo w_hi L^2, so with the penalty the fitted log ratio is about
+# L · 4 w_lo w_hi / (4 w_lo w_hi + λ). With λ = 4 n0 / N and one small part (w_hi ≈ 1) this is L · n_lo / (n_lo + n0):
+# n0 is the number of particles at which a moderate log ratio is shrunk halfway. Large mismatches cost D far more than
+# the quadratic approximation (2 sinh δ grows exponentially), so well-supported large ratios are shrunk much less.
+penalty_lambda(n0, N) = 4n0 / N
+
 # Guards for use in a sampler
 #
 # A fit is only constrained where there are particles. With one side (nearly) empty, the slope on that side is
