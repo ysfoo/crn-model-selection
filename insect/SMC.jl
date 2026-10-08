@@ -371,6 +371,67 @@ function compute_QB_info(
     )
 end
 
+## Population info for `nuts_transformed_move`: per-coordinate two-slope maps (transform_maps.jl) and the step size
+# Before every round, fit a two-slope map to each spike-and-slab coordinate by minimising the sample Fisher divergence
+# with the log-slope penalty λ = λN / N (default 100 / N), and the equal-slope optimum (the affine nutpie map) to the other
+# coordinates. As in `compute_invmass`, the 1% of particles with the lowest log target are left out of the fit. A fit
+# whose asymptotes are far from the slopes the particles see (`check_asymptotes`) falls back to the equal-slope map. NUTS
+# then runs in u with the identity mass matrix, since the D-optimal maps already set the scale of each coordinate. The
+# step size follows the same rule as `compute_QB_info` (quasi-binomial fit in pass 1, never increasing in later passes);
+# particles carry their step size from the previous round, in latent units.
+function compute_TQB_info(
+    particles, target, npass; acc_target=0.8, jitter=0.2, max_dlog=Inf, use_ngrad=false, min_obs=20, λN=DEFAULT_λN,
+    ζ_min=0.2, verbose=1,
+)
+    stepsizes = [p.stepsize for p in particles]
+    valid = filter(s -> isfinite(s) && s > 0, stepsizes)
+    stepsize = exp(mean(log.(valid))) # nominal stepsize is previous stepsize
+
+    accs = [hasproperty(p.info, :curr_acc_rate) ? p.info.curr_acc_rate : NaN for p in particles]
+    weights = use_ngrad ? [hasproperty(p.info, :curr_n_grad) ? p.info.curr_n_grad : NaN for p in particles] : nothing
+    fit = fit_acc_stepsize(stepsizes, accs; acc_target, weights, min_obs, max_dlog)
+    if npass > 1
+        stepsize *= 0.95 # decrease if multiple NUTS rounds
+         if !isnothing(fit)
+            stepsize = min(stepsize, fit.stepsize) # don't increase stepsize
+         end
+    elseif !isnothing(fit)
+        stepsize = fit.stepsize
+    end
+
+    # scores at the current states, as in `compute_invmass`
+    logp_func = Base.Fix1(LogDensityProblems.logdensity, target)
+    x1 = particles[1].state
+    d, n = length(x1), length(particles)
+    X, G, logp = Matrix{Float64}(undef, d, n), Matrix{Float64}(undef, d, n), Vector{Float64}(undef, n)
+    result = DiffResults.GradientResult(x1)
+    for (i, p) in enumerate(particles)
+        X[:, i] .= p.state
+        result = ForwardDiff.gradient!(result, logp_func, p.state)
+        logp[i] = DiffResults.value(result)
+        G[:, i] .= DiffResults.gradient(result)
+    end
+    keep = logp .>= quantile(logp, 0.01)   # drop bottom 1% by log target density
+
+    maps = Vector{TwoSlope}(undef, d)
+    t_fit = @elapsed for k in 1:d
+        θ, α = X[k, keep], G[k, keep]
+        if k in ss_idxs
+            f = fit_twoslope(θ, α, thres; λ=λN / length(θ), ζ_min)
+            maps[k], reason = check_asymptotes(f.m, f.u, θ, α)
+            isempty(reason) || @warn "Two-slope fit of coordinate $k replaced by the equal-slope map" reason f.m
+        else
+            maps[k] = equal_slope_map(θ, α)
+        end
+    end
+    if verbose > 0
+        @info "Two-slope maps (pass $npass)" t_fit stepsize maps = [(round(m.θs, digits=2), round(m.slo, sigdigits=3),
+            round(m.shi, sigdigits=3), round(m.ζ, sigdigits=3)) for m in maps[ss_idxs]]
+        flush(stdout)
+    end
+    return (invmass = ones(d), stepsize = stepsize, jitter = jitter, maps = maps)
+end
+
 
 ## Fisher-Rao path
 abstract type FRStrategy end

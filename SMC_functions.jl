@@ -1,5 +1,6 @@
 include(joinpath(@__DIR__, "stats_helpers.jl"));
 include(joinpath(@__DIR__, "plot_helpers.jl"));
+include(joinpath(@__DIR__, "transform_maps.jl"));
 
 using Distributions, Random, StableRNGs, Statistics, StatsBase
 using Distances, LinearAlgebra, LogExpFunctions, NearestNeighbors
@@ -150,6 +151,21 @@ function nuts_invmass_move(rng, particle, target, n_nuts, pop_info)
     logtarget = stats[end].log_density
 
     return SMCParticle(θs[end], NaN, isfinite(logtarget) ? logtarget : -Inf, stepsize, agg_n_nuts, info)
+end
+
+# NUTS on the transformed target θ_k = F_k(u_k) (see transform_maps.jl), with the per-coordinate maps in `pop_info.maps`
+# (fitted to the population before the round, e.g. by `compute_TQB_info`) and the identity mass matrix in
+# `pop_info.invmass`. The particle is mapped to u, moved by `nuts_invmass_move` on `TransformedTarget`, and mapped back.
+# The stored log target is that of θ (the latent density minus Σ log F'), `info.delta` is the θ-space change, and the
+# step size and the jump statistics (`sum_sqjdist`, `curr_esjd_per_grad`) are in latent units.
+function nuts_transformed_move(rng, particle, target, n_nuts, pop_info)
+    maps = pop_info.maps
+    u0 = to_latent(maps, particle.state)
+    moved = nuts_invmass_move(rng, @set(particle.state = u0), TransformedTarget(target, maps), n_nuts, pop_info)
+    θ = to_theta(maps, moved.state)
+    logtarget = isfinite(moved.logtarget) ? moved.logtarget - logjac(maps, moved.state) : -Inf
+    info = merge(moved.info, (delta = θ .- particle.state,))
+    return SMCParticle(θ, NaN, logtarget, moved.stepsize, moved.n_nuts, info)
 end
 
 # Squared jump distance per NUTS iteration; runs saved before `sum_sqjdist` was introduced store it as `info.esjd`.

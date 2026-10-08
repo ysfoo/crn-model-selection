@@ -8,8 +8,9 @@
 # The population of iteration i (equal weights, targeting π_(γ_i)) is moved at its own γ_i by two methods:
 #   affine:      NUTS on θ with the nutpie diagonal mass matrix of the population (the current sampler);
 #   transformed: NUTS on u, θ_k = F_k(u_k), with an identity mass matrix. Spike-and-slab coordinates get the two-slope
-#                map fitted to the population, or the equal-slope optimum (the affine nutpie map) if the fit fails
-#                `guard_map`; the other coordinates get the equal-slope optimum.
+#                map fitted to the population with the default log-slope penalty (λ = 100 / N), or the equal-slope
+#                optimum (the affine nutpie map) if `check_asymptotes` fails; the other coordinates get the equal-slope
+#                optimum. This is the rule `compute_TQB_info` uses in SMC.
 # Maps and the affine mass matrix come from the whole (trimmed) population; the moves are run on a random subset of n_sub
 # particles. Each method gets two rounds of 5 NUTS transitions (`repeat_5`): round A, then round B with the step size
 # from the quasi-binomial fit to round A's acceptance (as `compute_QB_info` does in pass 1). The affine round A uses the
@@ -67,7 +68,7 @@ maps = [equal_slope_map(X[k, keep], G[k, keep]) for k in 1:n_dim]
 map_rows = Vector{Vector{Any}}()
 for k in ss_idxs
     f = fit_twoslope(k, X[k, keep], G[k, keep])
-    m, reason = guard_map(f, X[k, keep], G[k, keep])
+    m, reason = check_asymptotes(f.m, f.u, X[k, keep], G[k, keep])
     maps[k] = m
     @info "map $(COORD_NAMES[k])" f.m f.D f.D_affine used_twoslope = isempty(reason) reason
     push!(map_rows, Any[k, COORD_NAMES[k], f.m.θs, f.m.slo, f.m.shi, f.m.ζ, f.D, f.D_affine, isempty(reason), reason])
