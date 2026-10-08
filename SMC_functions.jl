@@ -379,13 +379,37 @@ function refresh_logtargets(particles, ldp_builder, prior_path, γ; parallel=:se
 end
 
 
+# Seconds since this process started (Linux only, from /proc; NaN elsewhere). Used for the start-up time of a run: Julia
+# start, package loading, problem setup, worker start-up and the initial population.
+function process_uptime()
+    try
+        stat = read("/proc/self/stat", String)
+        fields = split(stat[findlast(')', stat)+2:end])   # fields 3 onwards (the command name may contain spaces)
+        start_ticks = parse(Float64, fields[20])           # field 22: start time, in clock ticks after boot
+        clk_tck = ccall(:sysconf, Clong, (Cint,), 2)       # sysconf(_SC_CLK_TCK)
+        uptime = parse(Float64, split(read("/proc/uptime", String))[1])
+        return uptime - start_ticks / clk_tck
+    catch
+        return NaN
+    end
+end
+
+# Start-up time of a run_SMC / resume_SMC call: since the process started for the first call, and since the previous
+# call ended for later calls in the same process (e.g. a test script running several backends).
+const _SMC_LAST_END = Ref(NaN)
+startup_time() = isnan(_SMC_LAST_END[]) ? process_uptime() : time() - _SMC_LAST_END[]
+
 # Runs one SMC iteration: reweight → resample → move.
-# Modifies all_particles, targetinfos, npass_vec, figs, smc_times.
+# Modifies all_particles, targetinfos, npass_vec, figs, smc_times, wall_times, clock.
+# `smc_times` holds the master's wall time plus the summed per-particle move times (comparable within a backend only:
+# with :threads, every GC pause also stalls the other threads' moves). `wall_times` holds the wall time of each
+# iteration, measured from `clock[]` (the previous iteration's mark) to just before the checkpoint, so that a checkpoint
+# write counts towards the next iteration. `startup_times` (one entry per run or resume) is only saved here.
 # Returns whether to terminate SMC.
 function SMC_iteration!(
     iter, pop_size, target_ess,
-    all_particles, targetinfos, npass_vec, figs, smc_times,
-    prior_path, ldp_builder, move_func, n_nuts_func, compute_pop_info, fname, rng; 
+    all_particles, targetinfos, npass_vec, figs, smc_times, wall_times, startup_times, clock,
+    prior_path, ldp_builder, move_func, n_nuts_func, compute_pop_info, fname, rng;
     max_npass=10, refresh_logtarget=true,
     parallel=:serial, pbar_lines=pop_size, vid_path=nothing, make_fig=nothing, verbose=0
 )
@@ -470,8 +494,11 @@ function SMC_iteration!(
     end
     push!(npass_vec, npass)
     push!(smc_times, smc_time)
+    t_mark = time()
+    push!(wall_times, t_mark - clock[])
+    clock[] = t_mark
 
-    @save fname all_particles iter targetinfos npass_vec smc_times prior_path
+    @save fname all_particles iter targetinfos npass_vec smc_times wall_times startup_times prior_path
 
     return false
 end
@@ -567,23 +594,26 @@ function run_SMC(
         init_stepsize, 0, Ref(NamedTuple())
     )]
     targetinfos = [get_targetinfo!(0., iter, prior_path)]
-    npass_vec, smc_times = Int64[], Float64[]
+    npass_vec, smc_times, wall_times = Int64[], Float64[], Float64[]
 
     figs = Figure[]
-    if !isnothing(vid_path)        
+    if !isnothing(vid_path)
         mkpath(vid_path)
     end
 
+    startup_times = [startup_time()]
+    clock = Ref(time())
     while true
         iter += 1
         SMC_done = SMC_iteration!(
             iter, pop_size, target_ess,
-            all_particles, targetinfos, npass_vec, figs, smc_times,
+            all_particles, targetinfos, npass_vec, figs, smc_times, wall_times, startup_times, clock,
             prior_path, ldp_builder, move_func, n_nuts_func, compute_pop_info, fname, rng;
             max_npass, refresh_logtarget, parallel, pbar_lines, vid_path, make_fig, verbose
         )
         (SMC_done || iter >= max_iter) && break
     end
+    _SMC_LAST_END[] = time()
 
     if !isnothing(vid_path)
         VideoIO.save(
@@ -610,6 +640,10 @@ function resume_SMC(
     # prior_path is updated during SMC, so use the saved one (older files lack it; fall back to the argument)
     prior_path = jldopen(f -> haskey(f, "prior_path") ? f["prior_path"] : prior_path_arg, fname)
     @assert length(all_particles) == (iter + 1)
+    # older files lack wall times; their iterations and start-up count as NaN
+    wall_times, startup_times = load_SMC_wall(fname)
+    wall_times = something(wall_times, fill(NaN, iter))
+    startup_times = something(startup_times, [NaN])
 
     figs = Figure[]
     if !isnothing(vid_path)
@@ -621,16 +655,19 @@ function resume_SMC(
     flush(stdout)
     flush(stderr)
 
+    push!(startup_times, startup_time())
+    clock = Ref(time())
     while true
         iter += 1
         SMC_done = SMC_iteration!(
             iter, pop_size, target_ess,
-            all_particles, targetinfos, npass_vec, figs, smc_times,
+            all_particles, targetinfos, npass_vec, figs, smc_times, wall_times, startup_times, clock,
             prior_path, ldp_builder, move_func, n_nuts_func, compute_pop_info, fname, rng;
             max_npass, refresh_logtarget, parallel, pbar_lines, vid_path, make_fig, verbose
         )
         (SMC_done || iter >= max_iter) && break
     end
+    _SMC_LAST_END[] = time()
 
     if !isnothing(vid_path)
         VideoIO.save(
@@ -647,6 +684,14 @@ end
 function load_SMC(fname)
     @load fname all_particles iter targetinfos npass_vec smc_times
     return all_particles, iter, targetinfos, npass_vec, smc_times
+end
+
+# Returns `(wall_times, startup_times)`, each `nothing` for files saved before they were recorded. The total wall time
+# of a run (all segments) is `sum(startup_times) + sum(wall_times)`, apart from the last checkpoint write.
+function load_SMC_wall(fname)
+    return jldopen(fname) do f
+        (haskey(f, "wall_times") ? f["wall_times"] : nothing, haskey(f, "startup_times") ? f["startup_times"] : nothing)
+    end
 end
 
 # Log-odds of the conditional marginal posterior p(z_j = 1 | k_j, ψ) (eq:combi_cond_zpost) for a spike-and-slab
