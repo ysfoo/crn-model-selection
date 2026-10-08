@@ -54,6 +54,12 @@ final_dists = [
 ];
 final_logprior_func(θ) = sum(logpdf(dist, val) for (dist, val) in zip(final_dists, θ));
 
+extract_γ(targetinfo) = begin
+    hasproperty(targetinfo, :γ) && return targetinfo.γ
+    hasproperty(targetinfo, :β) && return targetinfo.β
+    return last(targetinfo)    
+end
+
 convert_HMS(s) = string(floor(Int, s÷3600), ":", lpad(floor(Int, s%3600÷60), 2, '0'), ":", lpad(floor(Int, s%60), 2, '0'));
 
 # Load previous results
@@ -66,9 +72,9 @@ tvds_rAMIS = [0.5sum(abs, pvec_BS .- pvec_rAMIS) for (pvec_BS, pvec_rAMIS) in zi
 ### End setup
 
 ## Load SMC results
-run_str = "SMC875_5k"
-
-SMC_fname = joinpath(@__DIR__, "output/$(run_str).jld2");
+run_str = "SMC505"
+psize_str = "4k"
+SMC_fname = joinpath(@__DIR__, "output/$(run_str)_$(psize_str).jld2");
 
 pvecs_SMC = [Float64[] for _ in 1:n_feasible];
 hours_SMC = [0. for _ in 1:n_feasible];
@@ -81,16 +87,16 @@ end;
 
 tmp = 0;
 @showprogress for dir_idx in 1:n_feasible
-    OUTDIR = joinpath(@__DIR__, "output/data$(dir_idx)");
-    fname = "$OUTDIR/$(run_str).jld2"
+    fname = joinpath(@__DIR__, "output/data$(dir_idx)/$(run_str)_$(psize_str).jld2")
     if hours_SMC[dir_idx] > 0
         tmp += 1
+        sleep(0.01)
         continue
     end
     if isfile(fname)
-        @load fname all_particles iter targetinfos smc_times;
+        all_particles, iter, targetinfos, npass_vec, smc_times = load_SMC(fname);
         # println(targetinfos[end])
-        if targetinfos[end] == (1.,)
+        if extract_γ(targetinfos[end]) == 1.
             tmp += 1
             pvecs_SMC[dir_idx] = get_pvec(all_particles[end], thres)
             hours_SMC[dir_idx] = sum(smc_times)/3600
@@ -101,31 +107,28 @@ tmp = 0;
         end
     end
 end
+tvds_SMC = [dir_idx => 0.5sum(abs, pvec_BS .- pvec_SMC) for (dir_idx, pvec_BS, pvec_SMC) in zip(1:n_feasible, pvecs_BS, pvecs_SMC) if !isempty(pvec_SMC)];
 
 tmp
-findall(isempty.(pvecs_SMC))
+# findall(isempty.(pvecs_SMC))
 
-tvds_SMC = [dir_idx => 0.5sum(abs, pvec_BS .- pvec_SMC) for (dir_idx, pvec_BS, pvec_SMC) in zip(1:n_feasible, pvecs_BS, pvecs_SMC) if !isempty(pvec_SMC)];
-tvds_SMC
 summarystats(last.(tvds_SMC)) |> display
+tvds_SMC
 sort(tvds_SMC, by=last)[end-9:end]
 
-filter(!iszero, hours_SMC)
-filter(!iszero, length.(targetinfos_vec)) .- 1
+println(round.(Int, filter(!iszero, hours_SMC)))
+println(filter(!iszero, ns_nuts))
+println(filter(!iszero, length.(targetinfos_vec)) .- 1)
 
-hours_SMC[subset_idxs]
-length.(targetinfos_vec[subset_idxs]) .- 1
-
-summarystats(filter(!iszero, ns_nuts)) |> display
 summarystats(filter(!iszero, hours_SMC)) |> display
+summarystats(filter(!iszero, ns_nuts)) |> display
 summarystats(filter(!iszero, length.(targetinfos_vec)) .- 1) |> display
 
-summarystats((ns_nuts ./ (length.(targetinfos_vec) .- 1)) .|> mean)
-summarystats(375 ./ hours_SMC)
-
-hist(filter(!iszero, ns_nuts), axis=(xlabel="Number of NUTS iterations",))
 hist(filter(!iszero, hours_SMC), axis=(xlabel="Computational time (hours)",))
+hist(filter(!iszero, ns_nuts), axis=(xlabel="Number of NUTS iterations",))
 hist(filter(!iszero, length.(targetinfos_vec)) .- 1, axis=(xlabel="Number of SMC iterations", xticks=1:100))
+
+@save SMC_fname pvecs_SMC hours_SMC ns_nuts targetinfos_vec;
 
 ## Check some individual runs
 
@@ -140,7 +143,7 @@ var(reduce(hcat, getproperty.(all_particles[1], :state)), dims=2)
 
 pvec_SMC = get_pvec(all_particles[end], thres);
 0.5sum(abs, pvecs_BS[dir_idx] .- pvec_SMC)
-esjds_872 = [[particle.info.esjd for particle in particles] for particles in all_particles[2:end]];
+esjds_872 = [[esjd_per_nuts(particle) for particle in particles] for particles in all_particles[2:end]];
 
 fig = make_fig(all_particles[end], iter)
 vid_path = joinpath(@__DIR__, "imgs/$(run_str)/data$(dir_idx)") |> mkpath;
@@ -156,7 +159,7 @@ var(reduce(hcat, getproperty.(all_particles[1], :state)), dims=2)
 length(all_particles[end])
 pvec_SMC = get_pvec(all_particles[end], thres);
 0.5sum(abs, pvecs_BS[dir_idx] .- pvec_SMC)
-esjds_762 = [[particle.info.esjd for particle in particles] for particles in all_particles[2:end]];
+esjds_762 = [[esjd_per_nuts(particle) for particle in particles] for particles in all_particles[2:end]];
 
 fig = make_fig(all_particles[end], iter)
 vid_path = joinpath(@__DIR__, "imgs/$(run_str)/data$(dir_idx)") |> mkpath;
