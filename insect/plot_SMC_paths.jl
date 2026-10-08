@@ -13,6 +13,8 @@ std_idxs = 1:3 # ODE parameters with standard prior
 ss_idxs = 4:9 # ODE parameters with spike-and-slab prior
 n_ss = length(ss_idxs)
 μ_slab, μ_spike = 0., -16.;
+σ_slab = σ_spike = 2.;
+slab_prior, spike_prior = Normal(μ_slab, σ_slab), Normal(μ_spike, σ_spike);
 thres = 0.5 * (μ_spike + μ_slab);
 
 extract_γ(targetinfo) = begin
@@ -48,7 +50,7 @@ function summarise_run(fname)
     all_particles, iter, targetinfos, npass_vec, smc_times = load_SMC(fname)
     moved = all_particles[2:end]
     return (;
-        pvec = get_pvec(all_particles[end], thres),
+        pvec = get_pvec(all_particles[end]),
         γs = extract_γ.(targetinfos), # includes γ = 0
         smc_times, npass_vec,
         n_nuts = [ps[1].n_nuts for ps in moved],

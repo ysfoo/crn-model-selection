@@ -1,6 +1,6 @@
 include(joinpath(@__DIR__, "SMC.jl"))
 
-run_str = "SMC545"  # SMC505 with the :distributed backend (x4x = distributed runs, x0x = threads)
+run_str = "SMC545"
 σ0 = sqrt(68);
 unimodal_prior = Normal(μ0, σ0);
 unimodal_dists = [

@@ -98,7 +98,7 @@ tmp = 0;
         # println(targetinfos[end])
         if extract_γ(targetinfos[end]) == 1.
             tmp += 1
-            pvecs_SMC[dir_idx] = get_pvec(all_particles[end], thres)
+            pvecs_SMC[dir_idx] = get_pvec(all_particles[end])
             hours_SMC[dir_idx] = sum(smc_times)/3600
             ns_nuts[dir_idx] = sum(ps[1].n_nuts for ps in all_particles[2:end])
             targetinfos_vec[dir_idx] = targetinfos
@@ -141,7 +141,7 @@ fname = "$OUTDIR/$(run_str).jld2"
 @load fname all_particles iter targetinfos smc_times;
 var(reduce(hcat, getproperty.(all_particles[1], :state)), dims=2)
 
-pvec_SMC = get_pvec(all_particles[end], thres);
+pvec_SMC = get_pvec(all_particles[end]);
 0.5sum(abs, pvecs_BS[dir_idx] .- pvec_SMC)
 esjds_872 = [[esjd_per_nuts(particle) for particle in particles] for particles in all_particles[2:end]];
 
@@ -157,7 +157,7 @@ fname = "$OUTDIR/$(run_str).jld2"
 var(reduce(hcat, getproperty.(all_particles[1], :state)), dims=2)
 
 length(all_particles[end])
-pvec_SMC = get_pvec(all_particles[end], thres);
+pvec_SMC = get_pvec(all_particles[end]);
 0.5sum(abs, pvecs_BS[dir_idx] .- pvec_SMC)
 esjds_762 = [[esjd_per_nuts(particle) for particle in particles] for particles in all_particles[2:end]];
 

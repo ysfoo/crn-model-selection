@@ -649,7 +649,46 @@ function load_SMC(fname)
     return all_particles, iter, targetinfos, npass_vec, smc_times
 end
 
-function get_mode_probs(states, thres, Ws=ones(length(states)))
+# Log-odds of the conditional marginal posterior p(z_j = 1 | k_j, ψ) (eq:combi_cond_zpost) for a spike-and-slab
+# coordinate x = log10 k_j, with inclusion probability logistic(logit_p). The log10 Jacobian is common to the spike
+# and slab densities, so it cancels. Uses the globals `slab_prior` and `spike_prior`.
+cond_incl_logodds(x, logit_p) = logpdf(slab_prior, x) - logpdf(spike_prior, x) + logit_p
+
+# Monte Carlo estimate of the model posterior p(z | y) (eq:combi_zpost): the (weighted) average over particles of
+# p(z | k_n, ψ_n) = Π_j p(z_j | k_{n,j}, ψ_n). `logit_p(θ)` returns the logit of the inclusion probability
+# (0 for p = 1/2). Models are ordered as in `combinations(1:n_ss)`.
+function get_mode_probs(states, Ws=ones(length(states)); logit_p=Returns(0.0))
+    lookup = zeros(Int, 2^n_ss)
+    for (i, elems) in enumerate(combinations(1:n_ss))
+        idx = 0
+        for elem in elems
+            idx |= (1 << (elem - 1))
+        end
+        lookup[idx + 1] = i
+    end
+
+    probs = zeros(2^n_ss)
+    q1 = zeros(n_ss) # p(z_j = 1 | k_j, ψ)
+    q0 = zeros(n_ss) # p(z_j = 0 | k_j, ψ), computed separately for precision when q1 ≈ 1
+    for (state, W) in zip(states, Ws)
+        lp = logit_p(state)
+        for j in 1:n_ss
+            l = cond_incl_logodds(state[ss_idxs[j]], lp)
+            q1[j], q0[j] = logistic(l), logistic(-l)
+        end
+        for idx in 0:(2^n_ss - 1)
+            p = W
+            for j in 1:n_ss
+                p *= isodd(idx >> (j - 1)) ? q1[j] : q0[j]
+            end
+            probs[lookup[idx + 1]] += p
+        end
+    end
+    return probs ./ sum(Ws)
+end
+
+# Implied-model approximation: each particle counts towards the single model with z_j = 1 iff θ[ss_idxs[j]] > thres.
+function get_implied_mode_probs(states, thres, Ws=ones(length(states)))
     lookup = zeros(Int, 2^n_ss)
     for (i, elems) in enumerate(combinations(1:n_ss))
         idx = 0
@@ -672,33 +711,8 @@ function get_mode_probs(states, thres, Ws=ones(length(states)))
     return counts ./ sum(Ws)
 end
 
-function get_mode_probs_all(states, prob_func, Ws=ones(length(states)))
-    lookup = zeros(Int, 2^n_ss)
-    for (i, elems) in enumerate(combinations(1:n_ss))
-        idx = 0
-        for elem in elems
-            idx |= (1 << (elem - 1))
-        end
-        lookup[idx + 1] = i
-    end
-
-    probs = zeros(2^n_ss)
-    @showprogress for (state, W) in zip(states, Ws)
-        for idx in 1:(2^n_ss)
-            p = 1.
-            for j in 1:n_ss
-                p_factor = prob_func(state[ss_idxs[j]])
-                incl_j = isodd((idx-1) >> (j-1))
-                p *= incl_j ? p_factor : (1- p_factor)
-            end
-            probs[lookup[idx]] += p*W
-        end        
-    end
-    return probs ./ sum(Ws)
-end 
-
-function get_pvec(particles, thres, Ws=ones(length(particles)))
-    return get_mode_probs(getproperty.(particles, :state), thres, Ws)
+function get_pvec(particles, Ws=ones(length(particles)); logit_p=Returns(0.0))
+    return get_mode_probs(getproperty.(particles, :state), Ws; logit_p)
 end
 
 function make_fig(particles, iter, ss_idxs, ps)
