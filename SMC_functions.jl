@@ -5,6 +5,7 @@ using Distributions, Random, StableRNGs, Statistics, StatsBase
 using Distances, LinearAlgebra, LogExpFunctions, NearestNeighbors
 using AdvancedHMC, Bijectors, LogDensityProblems, LogDensityProblemsAD, ForwardDiff, PreallocationTools
 using Accessors, JLD2, ProgressMeter
+using Distributed: @everywhere, addprocs, myid, nprocs, nworkers, remotecall_fetch, workers
 using VideoIO
 
 
@@ -159,58 +160,180 @@ adapt_using_agg(info) = 1.5^((info.agg_acc_rate-0.8)/0.2)
 adapt_using_curr(info) = 1.5^((info.curr_acc_rate-0.8)/0.2)
 
 
+## Parallel backends
+# `parallel` in `run_SMC` and `resume_SMC` selects how the per-particle work (moves and log target evaluations) is spread:
+#   :serial      - one loop on the calling thread;
+#   :threads     - one task per Julia thread, each with its own copy of the target, taking particles one at a time from a
+#                  shared counter (so slow particles do not hold up a fixed block of others);
+#   :distributed - Distributed.jl worker processes (see `start_SMC_workers`). Each remote call rebuilds the target from
+#                  `(ldp_builder, prior_path, γ)` on the worker and processes a batch of particles. Every process has its
+#                  own heap, so a garbage collection on one worker does not stop the others;
+#   true / false - :distributed if worker processes exist, else :threads; false is :serial.
+# Each particle is moved with its own RNG, StableRNG(seed), with the seeds drawn from the master RNG before each round,
+# so results do not depend on the backend, on the number of threads or workers, or on which particle finishes first.
+
+function resolve_backend(parallel)
+    parallel === false && return :serial
+    parallel === true && return nprocs() > 1 ? :distributed : :threads
+    parallel in (:serial, :threads, :distributed) ||
+        throw(ArgumentError("parallel must be true, false, :serial, :threads or :distributed (got $(repr(parallel)))"))
+    parallel === :distributed && nprocs() == 1 &&
+        throw(ArgumentError("parallel = :distributed, but there are no worker processes (see start_SMC_workers)"))
+    return parallel
+end
+
+# Starts `n` worker processes for `parallel = :distributed` and makes each of them run `script` (by default the script
+# the master is running) with the master's command-line arguments, so that every definition in the problem script (prior
+# path, likelihood builder, move function, ...) also exists on the workers. `run_SMC` and `resume_SMC` return at once on
+# a worker, so only the master runs SMC; anything else the script does at top level runs on every process, so it must be
+# safe to repeat (e.g. `mkpath`, not copying or deleting files). Workers have one thread each.
+# Call this before pinning threads: worker processes inherit the CPU affinity of the master thread that starts them.
+# It does nothing on a worker, when `n == 0` or when workers already exist. `n` defaults to the environment variable
+# SMC_NWORKERS (unset: 0) and `heap_size_hint` (per worker) to SMC_WORKER_HEAP (unset: 2G).
+function start_SMC_workers(;
+    n=parse(Int, get(ENV, "SMC_NWORKERS", "0")), heap_size_hint=get(ENV, "SMC_WORKER_HEAP", "2G"),
+    script=PROGRAM_FILE,
+)
+    (myid() == 1 && n > 0 && nprocs() == 1) || return nothing
+    isempty(script) && error("start_SMC_workers needs the path of the problem script (there is none in an interactive session)")
+    script_path = abspath(script)
+    args = copy(ARGS)
+    t = @elapsed begin
+        addprocs(n; exeflags=`--project=$(Base.active_project()) --threads=1 --heap-size-hint=$heap_size_hint`)
+        @everywhere workers() begin
+            empty!(ARGS)
+            append!(ARGS, $args)
+            include($script_path)
+        end
+    end
+    @info "Started $n worker processes running $script_path in $(round(t; digits=1)) s"
+    flush(stdout)
+    flush(stderr)
+    return nothing
+end
+
+# Applies `f(target, args, item)` to every element of `items` with the given backend and returns the results in order.
+# `target` is used on the master (a copy per task with :threads); with :distributed, `target_spec = (ldp_builder,
+# prior_path, γ)` rebuilds it on the worker, so `target` must equal `ldp_builder(prior_path, γ)`. `f` may only modify its
+# target (`args` and the items are shared between tasks). `on_done(n_done)` is called on the master after each item
+# (:serial, :threads) or batch (:distributed), never concurrently. `batch_size` (:distributed only) defaults to about
+# 25 batches per worker.
+function particle_map(
+    f, args, items, target, target_spec, backend; batch_size=nothing, on_done=(n_done)->nothing,
+)
+    n = length(items)
+    results = Vector{Any}(undef, n)
+    if backend === :serial
+        for i in 1:n
+            results[i] = f(target, args, items[i])
+            on_done(i)
+        end
+    elseif backend === :threads
+        next_i = Threads.Atomic{Int}(1)
+        failed = Threads.Atomic{Bool}(false)
+        n_done = Ref(0)  # only changed while holding `done_lock`
+        done_lock = ReentrantLock()
+        @sync for _ in 1:min(n, Threads.nthreads())
+            Threads.@spawn begin
+                local_target = customcopy(target)
+                while !failed[]
+                    i = Threads.atomic_add!(next_i, 1)  # returns the value before the increment
+                    i > n && break
+                    try
+                        results[i] = f(local_target, args, items[i])  # each index is written by one task only
+                    catch
+                        failed[] = true
+                        rethrow()
+                    end
+                    lock(done_lock) do
+                        n_done[] += 1
+                        on_done(n_done[])
+                    end
+                end
+            end
+        end
+    elseif backend === :distributed
+        bs = isnothing(batch_size) ? max(1, cld(n, 25 * nworkers())) : batch_size
+        batches = collect(Iterators.partition(1:n, bs))
+        # One feeding task per worker, so a worker never has two calls in flight. The tasks run on the master thread
+        # and only switch at `remotecall_fetch`, so reading and advancing `next_b` (and `n_done`) cannot interleave.
+        next_b = Ref(1)
+        n_done = Ref(0)
+        failed = Ref(false)
+        @sync for w in workers()
+            @async while !failed[] && next_b[] <= length(batches)
+                idxs = batches[next_b[]]
+                next_b[] += 1
+                try
+                    results[idxs] = remotecall_fetch(_particle_batch, w, f, args, target_spec, items[idxs])
+                catch
+                    failed[] = true
+                    rethrow()
+                end
+                n_done[] += length(idxs)
+                on_done(n_done[])
+            end
+        end
+    else
+        throw(ArgumentError("unknown backend $(repr(backend))"))
+    end
+    return identity.(results)  # narrows the element type
+end
+
+# Runs on a worker: builds the target from `target_spec`, then applies `f` to a batch of items. The target is local to
+# the call, so nothing is shared between calls.
+function _particle_batch(f, args, target_spec, items)
+    ldp_builder, prior_path, γ = target_spec
+    target = ldp_builder(prior_path, γ)
+    return [f(target, args, item) for item in items]
+end
+
+# Moves one particle with its own RNG; returns the moved particle and the time the move took.
+function _move_particle(target, args, item)
+    move_func, n_nuts, pop_info = args
+    particle, seed = item
+    t = @elapsed moved = move_func(StableRNG(seed), particle, target, n_nuts, pop_info)
+    return (moved, t)
+end
+
+_logdensity_at(target, _, state) = LogDensityProblems.logdensity(target, state)
+
+
+# `target_spec = (ldp_builder, prior_path, γ)` rebuilds `target` (see `particle_map`).
 function perform_moves!(
-    particles, target, move_func, n_nuts_func, states_before_move, compute_pop_info,
-    iter, targetinfo, rngs;
+    particles, target, target_spec, move_func, n_nuts_func, states_before_move, compute_pop_info,
+    iter, targetinfo, rng;
     max_npass, pop_size, pbar_lines, parallel, verbose
 )
     npass = 0
     move_time = 0.0
     last_n_nuts = nothing
     while npass < max_npass
-        n_nuts = n_nuts_func(particles, last_n_nuts, npass, states_before_move; verbose, rng = rngs[1])
+        n_nuts = n_nuts_func(particles, last_n_nuts, npass, states_before_move; verbose, rng)
         n_nuts == 0 && break
 
         npass += 1
         last_n_nuts = n_nuts
         pop_info = compute_pop_info(particles, target, npass)
+        seeds = rand(rng, UInt64, length(particles))
 
         pbar = Progress(pop_size; desc="Iter $iter, pass $(npass)")
         pbar_step = max(1, pop_size ÷ pbar_lines)
-        if parallel
-            counter = Threads.Atomic{Int}(0)
-            pbar_lock = Threads.SpinLock()
-            targets = [customcopy(target) for _ in 1:pop_size]
-            thread_times = zeros(Threads.nthreads())
-            GC.gc(false)
-
-            Threads.@threads :static for i in 1:pop_size
-                particle = particles[i]
-                tid = Threads.threadid()
-                thread_times[tid] += @elapsed begin
-                    particles[i] = move_func(rngs[tid], particle, targets[i], n_nuts, pop_info)
-                end
-                prev_done = Threads.atomic_add!(counter, 1)
-                if (prev_done + 1) % pbar_step == 0
-                    lock(pbar_lock) do
-                        ProgressMeter.update!(pbar, prev_done + 1)
-                    end
-                end
+        last_shown = Ref(0)
+        on_done = function (n_done)
+            if n_done - last_shown[] >= pbar_step
+                ProgressMeter.update!(pbar, n_done)
+                last_shown[] = n_done
             end
-
-            if verbose > 1
-                display(thread_times)
-            end
-            move_time += sum(thread_times)
-        else
-            rng = rngs[1]
-            for i in 1:pop_size
-                particle = particles[i]
-                move_time += @elapsed particles[i] = move_func(rng, particle, target, n_nuts, pop_info)
-                if i % pbar_step == 0
-                    ProgressMeter.update!(pbar, i)
-                end
-            end
+        end
+        parallel === :threads && GC.gc(false)
+        results = particle_map(
+            _move_particle, (move_func, n_nuts, pop_info), collect(zip(particles, seeds)), target, target_spec, parallel;
+            on_done,
+        )
+        for (i, (moved, t)) in enumerate(results)
+            particles[i] = moved
+            move_time += t
         end
         ProgressMeter.finish!(pbar)
     end
@@ -226,19 +349,11 @@ end
 # resampled population onto one ancestor. `γ` is the path parameter of the population's own target.
 # Particles whose density is not finite when re-evaluated get log target and log likelihood -Inf (zero weight).
 function refresh_logtargets(particles, ldp_builder, prior_path, γ; parallel=false)
-    N = length(particles)
     target = ldp_builder(prior_path, γ)
-    logtargets = Vector{Float64}(undef, N)
-    if parallel
-        targets = [customcopy(target) for _ in 1:Threads.nthreads()]
-        Threads.@threads :static for i in 1:N
-            logtargets[i] = LogDensityProblems.logdensity(targets[Threads.threadid()], particles[i].state)
-        end
-    else
-        for i in 1:N
-            logtargets[i] = LogDensityProblems.logdensity(target, particles[i].state)
-        end
-    end
+    logtargets = particle_map(
+        _logdensity_at, nothing, [p.state for p in particles], target, (ldp_builder, prior_path, γ),
+        resolve_backend(parallel),
+    )
     return [
         begin
             lt = isfinite(logtargets[i]) ? logtargets[i] : -Inf
@@ -255,7 +370,7 @@ end
 function SMC_iteration!(
     iter, pop_size, target_ess,
     all_particles, targetinfos, npass_vec, figs, smc_times,
-    prior_path, ldp_builder, move_func, n_nuts_func, compute_pop_info, fname, rngs; 
+    prior_path, ldp_builder, move_func, n_nuts_func, compute_pop_info, fname, rng; 
     max_npass=10, refresh_logtarget=true,
     parallel=false, pbar_lines=pop_size, vid_path=nothing, make_fig=nothing, verbose=0
 )
@@ -287,12 +402,13 @@ function SMC_iteration!(
         return true
     end
     
-    rng = rngs[1]   
     γ = targetinfo.γ
     push!(targetinfos, targetinfo)
-    
+    # `build_target_SMC!` returns `ldp_builder(prior_path, γ)`, which is how workers rebuild the target
+    target_spec = (ldp_builder, prior_path, γ)
+
     prev_logtarget_vec = getproperty.(particles, :logtarget)
-    logtarget_vec = map(p -> LogDensityProblems.logdensity(target, p.state), particles)
+    logtarget_vec = particle_map(_logdensity_at, nothing, getproperty.(particles, :state), target, target_spec, parallel)
     logws = logtarget_vec .- prev_logtarget_vec
     logws[.!isfinite.(logws)] .= -Inf
 
@@ -312,8 +428,8 @@ function SMC_iteration!(
     # Move
     smc_time = time() - t_start
     npass, move_time = perform_moves!(
-        particles, target, move_func, n_nuts_func, states_before_move, compute_pop_info,
-        iter, targetinfo, rngs;
+        particles, target, target_spec, move_func, n_nuts_func, states_before_move, compute_pop_info,
+        iter, targetinfo, rng;
         max_npass, pop_size, pbar_lines, parallel, verbose
     )
     smc_time += move_time
@@ -395,18 +511,23 @@ function get_targetinfo!(γ, iter, prior_path)
     return (γ = γ,)
 end
 
+function log_backend(backend)
+    @info "SMC backend" backend Threads.nthreads() nworkers=(nprocs() > 1 ? nworkers() : 0)
+    flush(stdout)
+    flush(stderr)
+end
+
+# `parallel` selects the backend (see `resolve_backend`); `max_iter` stops after that many SMC iterations (for tests).
 function run_SMC(
     pop_size, target_ess, init_sampler, prior_path, ldp_builder, move_func, n_nuts_func, fname;
     init_pop_size=pop_size, init_stepsize::Float64=0.01, 
     max_npass=10, refresh_logtarget=true, compute_pop_info=(particles, target, npass)->(;),
     verbose=0, vid_path=nothing, make_fig=nothing,
-    parallel=false, pbar_lines=pop_size, rng=Random.default_rng()
+    parallel=false, pbar_lines=pop_size, rng=Random.default_rng(), max_iter=typemax(Int),
 )
-    if parallel
-        rngs = [StableRNG(rand(rng, UInt64)) for _ in 1:Threads.nthreads()]
-    else
-        rngs = [rng]
-    end
+    myid() == 1 || return nothing  # workers only serve the master (see `start_SMC_workers`)
+    parallel = resolve_backend(parallel)
+    log_backend(parallel)
     initstates = [init_sampler(rng) for _ in 1:init_pop_size] 
 
     iter = 0
@@ -415,7 +536,9 @@ function run_SMC(
     # use γ = 1 to extract likelihood
     tmp_target = ldp_builder(prior_path, 1.) 
     tmp_logpriors = prior_path.(initstates, 1.)
-    tmp_loglikes = LogDensityProblems.logdensity.(Ref(tmp_target), initstates) .- tmp_logpriors
+    tmp_loglikes = particle_map(
+        _logdensity_at, nothing, initstates, tmp_target, (ldp_builder, prior_path, 1.), parallel,
+    ) .- tmp_logpriors
 
     # finite_loglikes = filter(isfinite, tmp_loglikes)
     # finite_tmp_logpriors = filter(isfinite, tmp_logpriors)
@@ -441,10 +564,10 @@ function run_SMC(
         SMC_done = SMC_iteration!(
             iter, pop_size, target_ess,
             all_particles, targetinfos, npass_vec, figs, smc_times,
-            prior_path, ldp_builder, move_func, n_nuts_func, compute_pop_info, fname, rngs;
+            prior_path, ldp_builder, move_func, n_nuts_func, compute_pop_info, fname, rng;
             max_npass, refresh_logtarget, parallel, pbar_lines, vid_path, make_fig, verbose
         )
-        SMC_done && break
+        (SMC_done || iter >= max_iter) && break
     end
 
     if !isnothing(vid_path)
@@ -461,19 +584,17 @@ end
 function resume_SMC(
     pop_size, target_ess, prior_path, ldp_builder, move_func, n_nuts_func, fname;
     max_npass=10, refresh_logtarget=true, compute_pop_info=(particles, target, npass)->(;),
-    verbose=0, vid_path=nothing, make_fig=nothing, 
-    parallel=false, pbar_lines=pop_size, rng=Random.default_rng()
+    verbose=0, vid_path=nothing, make_fig=nothing,
+    parallel=false, pbar_lines=pop_size, rng=Random.default_rng(), max_iter=typemax(Int),
 )
+    myid() == 1 || return nothing  # workers only serve the master (see `start_SMC_workers`)
+    parallel = resolve_backend(parallel)
+    log_backend(parallel)
     prior_path_arg = prior_path
     @load fname all_particles iter targetinfos npass_vec smc_times
     # prior_path is updated during SMC, so use the saved one (older files lack it; fall back to the argument)
     prior_path = jldopen(f -> haskey(f, "prior_path") ? f["prior_path"] : prior_path_arg, fname)
     @assert length(all_particles) == (iter + 1)
-    if parallel
-        rngs = [StableRNG(rand(rng, UInt64)) for _ in 1:Threads.nthreads()]
-    else
-        rngs = [rng]
-    end
 
     figs = Figure[]
     if !isnothing(vid_path)
@@ -490,10 +611,10 @@ function resume_SMC(
         SMC_done = SMC_iteration!(
             iter, pop_size, target_ess,
             all_particles, targetinfos, npass_vec, figs, smc_times,
-            prior_path, ldp_builder, move_func, n_nuts_func, compute_pop_info, fname, rngs;
+            prior_path, ldp_builder, move_func, n_nuts_func, compute_pop_info, fname, rng;
             max_npass, refresh_logtarget, parallel, pbar_lines, vid_path, make_fig, verbose
         )
-        SMC_done && break
+        (SMC_done || iter >= max_iter) && break
     end
 
     if !isnothing(vid_path)
