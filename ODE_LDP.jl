@@ -12,8 +12,11 @@ make_gradconfig(n_θ) = ForwardDiff.GradientConfig(
     nothing, zeros(n_θ), ForwardDiff.Chunk(n_θ), ForwardDiff.Tag(OrdinaryDiffEqLDPTag(), Float64)
 )
 
-struct OrdinaryDiffEqLDP{PR<:ODEProblem, LP, LL, UP, UU, ALG, KW, CR, CC, TC1, TC2}
-    base_prob          :: PR
+# `base_prob` is deliberately abstractly typed. With a concrete type parameter, each model's ODEProblem type reaches
+# the compiled code, so across the 64 insect models every model recompiled the nested-dual ForwardDiff Hessian (about
+# 55 s each, against 0.5 to 5 s for most models when abstract). Run time per call is the same either way.
+struct OrdinaryDiffEqLDP{LP, LL, UP, UU, ALG, KW, CR, CC, TC1, TC2}
+    base_prob          :: ODEProblem
     n_θ                :: Int
     log_prior          :: LP
     log_likelihood     :: LL
