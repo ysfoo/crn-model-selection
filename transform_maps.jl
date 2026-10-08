@@ -73,15 +73,12 @@ equal_slope_map(θ, α) = (s = nutpie_scale(θ, α); TwoSlope(median(θ), s, s, 
 penalty_lambda(n0, N) = 4n0 / N
 const DEFAULT_λN = 100.0   # λ = DEFAULT_λN / N
 
-# Fit a two-slope map to one coordinate. `cut` splits the population for the split start (the classification threshold
-# of a spike-and-slab coordinate, or the median); a second start is the affine nutpie map, and the better penalised
-# optimum is kept. f.D is the unpenalised D at the penalised optimum, f.D_pen the penalised objective.
-function fit_twoslope(θ::AbstractVector, α::AbstractVector, cut::Real; ζ0=1.0, λ=DEFAULT_λN / length(θ), ζ_min=0.2)
+# Split start at `cut`: part-wise nutpie scale and centre (Seyboldt et al., Thm 2.2), ζ = ζ0, and θ* placed d local
+# scales from the centre of the narrower part. A part with fewer than 20 particles takes the other part's scale.
+function split_start(θ, α, cut; ζ0=1.0)
     s_glob = nutpie_scale(θ, α)
     lo, hi = θ .<= cut, θ .> cut
     n_lo, n_hi = count(lo), count(hi)
-    # Split start: part-wise nutpie scale and centre (Seyboldt et al., Thm 2.2); a part with fewer than 20 particles
-    # takes the other part's scale.
     slo = n_lo >= 20 ? nutpie_scale(θ[lo], α[lo]) : NaN
     shi = n_hi >= 20 ? nutpie_scale(θ[hi], α[hi]) : NaN
     isnan(slo) && (slo = isnan(shi) ? s_glob : shi)
@@ -91,24 +88,35 @@ function fit_twoslope(θ::AbstractVector, α::AbstractVector, cut::Real; ζ0=1.0
     d = 3 + ζ0 * abs(log(slo / shi))
     θs = shi < slo ? mhi - shi * d : mlo + slo * d
     isfinite(θs) || (θs = median(θ))
+    return (m=TwoSlope(θs, slo, shi, ζ0), n_lo, n_hi, m_lo=mlo, m_hi=mhi)
+end
 
-    starts = [:split => TwoSlope(θs, slo, shi, ζ0), :affine => TwoSlope(median(θ), s_glob, s_glob, ζ0)]
+# Fit a two-slope map to one coordinate: one Nelder-Mead run from each of three starts (split at the 25% and 75%
+# quantiles, and the affine nutpie map), keeping the best penalised optimum. On 150 coordinate fits of stored insect
+# populations these three starts reached the best optimum found from five starts with two restarts each to within a
+# relative 6e-8, while the earlier scheme (split at the spike-and-slab threshold and affine, each with two restarts) was
+# up to 0.7% off; restarts changed the objective by about 1e-10 (median). The fit uses no threshold: `cut` only sets the
+# split for the diagnostic part-wise numbers returned with the fit (n_lo, n_hi, part centres and scales, flags).
+# f.D is the unpenalised D at the penalised optimum, f.D_pen the penalised objective.
+function fit_twoslope(θ::AbstractVector, α::AbstractVector; cut=median(θ), ζ0=1.0, λ=DEFAULT_λN / length(θ), ζ_min=0.2)
+    s_glob = nutpie_scale(θ, α)
+    starts = [:q25 => split_start(θ, α, quantile(θ, 0.25); ζ0).m, :q75 => split_start(θ, α, quantile(θ, 0.75); ζ0).m,
+        :affine => TwoSlope(median(θ), s_glob, s_glob, ζ0)]
     obj(p) = (v = Dk(to_map(p, ζ_min), θ, α) + λ * (p[3] - p[2])^2; isfinite(v) ? v : Inf)
     best = nothing
     for (name, m0) in starts
-        p = from_map(m0, ζ_min)
-        res = nothing
-        for _ in 1:3   # restart Nelder-Mead from its own optimum
-            res = optimize(obj, p, NelderMead(), Optim.Options(iterations=4000, f_reltol=1e-12, x_abstol=1e-10))
-            p = Optim.minimizer(res)
-        end
+        res = optimize(obj, from_map(m0, ζ_min), NelderMead(), Optim.Options(iterations=4000, f_reltol=1e-12, x_abstol=1e-10))
         D = Optim.minimum(res)
         if isnothing(best) || D < best.D_pen
-            m = to_map(p, ζ_min)
+            m = to_map(Optim.minimizer(res), ζ_min)
             best = (D=Dk(m, θ, α), D_pen=D, m=m, start=name, D_start=obj(from_map(m0, ζ_min)))
         end
     end
 
+    # diagnostics relative to the split at `cut`
+    parts = split_start(θ, α, cut; ζ0)
+    lo, hi = θ .<= cut, θ .> cut
+    n_lo, n_hi, mlo, mhi, slo, shi = parts.n_lo, parts.n_hi, parts.m_lo, parts.m_hi, parts.m.slo, parts.m.shi
     m = best.m
     # flags: ζ at its lower bound; θ* within 2 local sds (part-wise Fisher scale) of either part's centre
     centres = filter(c -> isfinite(c.m), [(m=mlo, s=slo), (m=mhi, s=shi)])

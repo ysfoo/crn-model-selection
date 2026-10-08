@@ -24,9 +24,10 @@ end
 # Parts used for the split start, the flags and the per-part latent scales.
 split_point(k, θ) = k in ss_idxs ? thres : median(θ)
 
-# Fit for coordinate k (default penalty λ = 100 / N, see `penalty_lambda` in ../transform_maps.jl).
+# Fit for coordinate k (default penalty λ = 100 / N, see `penalty_lambda` in ../transform_maps.jl). The split at
+# `split_point` only sets the diagnostic part-wise numbers; the fit itself does not use it.
 fit_twoslope(k::Integer, θ::AbstractVector, α::AbstractVector; kwargs...) =
-    fit_twoslope(θ, α, split_point(k, θ); ζ_min=ZETA_MIN, kwargs...)
+    fit_twoslope(θ, α; cut=split_point(k, θ), ζ_min=ZETA_MIN, kwargs...)
 
 # Older hard guard (superseded by the log-slope penalty plus `check_asymptotes`): fall back to the equal-slope optimum
 # unless both parts (split at `thres` for spike-and-slab coordinates) have at least n_min particles, at least n_min

@@ -372,10 +372,10 @@ function compute_QB_info(
 end
 
 ## Population info for `nuts_transformed_move`: per-coordinate two-slope maps (transform_maps.jl) and the step size
-# Before every round, fit a two-slope map to each spike-and-slab coordinate by minimising the sample Fisher divergence
-# with the log-slope penalty λ = λN / N (default 100 / N), and the equal-slope optimum (the affine nutpie map) to the other
-# coordinates. As in `compute_invmass`, the 1% of particles with the lowest log target are left out of the fit. A fit
-# whose asymptotes are far from the slopes the particles see (`check_asymptotes`) falls back to the equal-slope map. NUTS
+# Before every round, fit a two-slope map to every coordinate by minimising the sample Fisher divergence with the
+# log-slope penalty λ = λN / N (default 100 / N); the fit uses no spike-and-slab threshold. As in `compute_invmass`, the
+# 1% of particles with the lowest log target are left out of the fit. A fit whose asymptotes are far from the slopes the
+# particles see (`check_asymptotes`) falls back to the equal-slope optimum (the affine nutpie map). NUTS
 # then runs in u with the identity mass matrix, since the D-optimal maps already set the scale of each coordinate. The
 # step size follows the same rule as `compute_QB_info` (quasi-binomial fit in pass 1, never increasing in later passes);
 # particles carry their step size from the previous round, in latent units.
@@ -416,17 +416,13 @@ function compute_TQB_info(
     maps = Vector{TwoSlope}(undef, d)
     t_fit = @elapsed for k in 1:d
         θ, α = X[k, keep], G[k, keep]
-        if k in ss_idxs
-            f = fit_twoslope(θ, α, thres; λ=λN / length(θ), ζ_min)
-            maps[k], reason = check_asymptotes(f.m, f.u, θ, α)
-            isempty(reason) || @warn "Two-slope fit of coordinate $k replaced by the equal-slope map" reason f.m
-        else
-            maps[k] = equal_slope_map(θ, α)
-        end
+        f = fit_twoslope(θ, α; λ=λN / length(θ), ζ_min)
+        maps[k], reason = check_asymptotes(f.m, f.u, θ, α)
+        isempty(reason) || @warn "Two-slope fit of coordinate $k replaced by the equal-slope map" reason f.m
     end
     if verbose > 0
         @info "Two-slope maps (pass $npass)" t_fit stepsize maps = [(round(m.θs, digits=2), round(m.slo, sigdigits=3),
-            round(m.shi, sigdigits=3), round(m.ζ, sigdigits=3)) for m in maps[ss_idxs]]
+            round(m.shi, sigdigits=3), round(m.ζ, sigdigits=3)) for m in maps]
         flush(stdout)
     end
     return (invmass = ones(d), stepsize = stepsize, jitter = jitter, maps = maps)
