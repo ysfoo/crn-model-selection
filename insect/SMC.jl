@@ -421,8 +421,7 @@ function compute_TQB_info(
         isempty(reason) || @warn "Two-slope fit of coordinate $k replaced by the equal-slope map" reason f.m
     end
     if verbose > 0
-        @info "Two-slope maps (pass $npass)" t_fit stepsize maps = [(round(m.θs, digits=2), round(m.slo, sigdigits=3),
-            round(m.shi, sigdigits=3), round(m.ζ, sigdigits=3)) for m in maps]
+        @info "Two-slope maps (pass $npass)" t_fit stepsize
         flush(stdout)
     end
     return (invmass = ones(d), stepsize = stepsize, jitter = jitter, maps = maps)
