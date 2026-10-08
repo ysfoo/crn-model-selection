@@ -153,6 +153,20 @@ function nuts_invmass_move(rng, particle, target, n_nuts, pop_info)
     return SMCParticle(θs[end], NaN, isfinite(logtarget) ? logtarget : -Inf, stepsize, agg_n_nuts, info)
 end
 
+# Geometry (mass matrix, maps, ...) shared by the rounds of one SMC iteration: `f()` is evaluated before the first round
+# (npass == 1) and its result reused in later rounds with the same target object (`perform_moves!` passes the same target
+# to every round of an iteration, and a new one each iteration). `kind` keeps different `compute_pop_info` functions
+# apart. With `refit_each_pass=true`, `f()` is evaluated every round. Runs on the master only.
+const _GEOMETRY_CACHE = Ref{Any}(nothing)
+function cached_geometry(f, kind, target, npass, refit_each_pass)
+    c = _GEOMETRY_CACHE[]
+    if refit_each_pass || npass == 1 || isnothing(c) || c.kind !== kind || c.target !== target
+        c = (kind = kind, target = target, geometry = f())
+        _GEOMETRY_CACHE[] = c
+    end
+    return c.geometry
+end
+
 # NUTS on the transformed target θ_k = F_k(u_k) (see transform_maps.jl), with the per-coordinate maps in `pop_info.maps`
 # (fitted to the population before the round, e.g. by `compute_TQB_info`) and the identity mass matrix in
 # `pop_info.invmass`. The particle is mapped to u, moved by `nuts_invmass_move` on `TransformedTarget`, and mapped back.
