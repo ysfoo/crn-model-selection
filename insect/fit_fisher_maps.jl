@@ -2,7 +2,7 @@
 #
 # Usage (from insect/):
 #   julia --project=.. fit_fisher_maps.jl <data idx> <run name> [iterations...] [--fit=trim|full|both] [--zeta_min=0.2]
-#                                         [--variant=SMCnnn]
+#                                         [--variant=SMCnnn] [--min_gamma=0.01]
 # e.g. julia --project=.. fit_fisher_maps.jl 1 SMC505_4k
 #      julia --project=.. fit_fisher_maps.jl 1 SMC305_4k 22 25 28 30 35 --fit=both
 #
@@ -236,9 +236,11 @@ open(joinpath(fm_out, "iteration_table.csv"), "w") do io
 end
 
 # 4 iterations with at least 2 spike-and-slab coordinates of slab proportion in [0.1, 0.9], spread from high to low
-# mean gap occupancy, plus the final iteration.
+# mean gap occupancy, plus the final iteration. Iterations with γ < min_gamma are skipped: there the population still
+# follows the initial distribution, so slab proportions near 0.5 say nothing.
+const MIN_GAMMA = parse(Float64, get(fm_flags, "min_gamma", "0.01"))
 function default_iters(rows)
-    cand = [r for r in rows if 1 <= r.i < n_iter && count(0.1 .<= r.slab .<= 0.9) >= 2]
+    cand = [r for r in rows if 1 <= r.i < n_iter && r.γ >= MIN_GAMMA && count(0.1 .<= r.slab .<= 0.9) >= 2]
     sel = Int[]
     if !isempty(cand)
         cand = sort(cand; by=r -> -mean(r.gap))
@@ -323,6 +325,174 @@ function plot_iteration(i, γ, fits, X, fit_pop)
     return fpath
 end
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Curvature diagnostics for NUTS (skip with --no_curv)
+#
+# Along coordinate k, with the other coordinates fixed, the latent potential is U(u) = -log π(θ(u)) - log F'(u) with
+# θ_k = F(u), so
+#   U''(u) = -[F'(u)^2 h + F''(u) g + (log F')''(u)],   g = ∂_k log π, h = ∂²_k log π, F'' = F' (log F')'.
+# NUTS on the transformed target would use a diagonal mass matrix estimated in u-space (nutpie, M^{-1}_kk =
+# sqrt(Var u / Var a)), so the leapfrog integrator sees the scaled curvature κ = M^{-1}_kk U''. It is unstable where
+# ε √κ > 2, and the number of steps per U-turn grows with √(κ_max / κ_min). For the affine nutpie map, which is the
+# current sampler, κ = -s^2 h with s^2 = sqrt(Var θ / Var α) (the u-space mass matrix is then the identity).
+# Stored step sizes are those of the current (affine) sampler at that iteration, in the same scaled units.
+
+d2logdfmap(m::TwoSlope, u) = ForwardDiff.derivative(v -> dlogdfmap(m, v), u)
+
+function line_func(logp_func, θ, k)
+    return t -> begin
+        x = similar(θ, typeof(t)); x .= θ; x[k] += t
+        logp_func(x)
+    end
+end
+# Second derivative of log π along coordinate k. Nested forward mode; if that fails through the ODE solver, a central
+# difference of the forward-mode first derivative.
+const NESTED_AD = Ref(true)
+function line_h(logp_func, θ, k; δ=1e-4)
+    df = t -> ForwardDiff.derivative(line_func(logp_func, θ, k), t)
+    if NESTED_AD[]
+        try
+            return ForwardDiff.derivative(df, 0.0)
+        catch err
+            @warn "Nested forward mode failed; using central differences of the first derivative" exception = err
+            NESTED_AD[] = false
+        end
+    end
+    return (df(δ) - df(-δ)) / 2δ
+end
+line_vgh(logp_func, θ, k) = begin
+    f = line_func(logp_func, θ, k)
+    (f(0.0), ForwardDiff.derivative(f, 0.0), line_h(logp_func, θ, k))
+end
+
+latent_minv(f) = sqrt(popvar(f.u) / popvar(f.a))
+κ_twoslope(f, u, g, h) = begin
+    m = f.m
+    Fp, L1, L2 = dfmap(m, u), dlogdfmap(m, u), d2logdfmap(m, u)
+    -latent_minv(f) * (Fp^2 * h + Fp * L1 * g + L2)
+end
+κ_affine(f, h) = -f.s_affine^2 * h
+
+# Scaled curvature of every (trimmed) particle and coordinate, for both maps.
+function population_curvature(logp_func, X, G, fits)
+    n = size(X, 2)
+    K2, KA = Matrix{Float64}(undef, n_dim, n), Matrix{Float64}(undef, n_dim, n)
+    for j in 1:n, k in 1:n_dim
+        h = line_h(logp_func, X[:, j], k)
+        K2[k, j] = κ_twoslope(fits[k], fits[k].u[j], G[k, j], h)
+        KA[k, j] = κ_affine(fits[k], h)
+    end
+    return K2, KA
+end
+
+const KFLOOR = 1e-4   # κ ≤ 0 (no restoring force) is drawn at this floor
+logκ(κ) = log10(max(κ, KFLOOR))
+qs_pos(κ, ps) = (p = filter(>(0), κ); isempty(p) ? fill(NaN, length(ps)) : quantile(p, ps))
+cond_spread(κ) = (p = filter(>(0), vec(κ)); isempty(p) ? NaN : sqrt(quantile(p, 0.99) / quantile(p, 0.01)))
+
+function plot_curvature(i, γ, X, fits, K2, KA, ε)
+    ncol = 5
+    fig = Figure(size=(ncol * 400, cld(n_dim, ncol) * 380), fontsize=11)
+    lim = (2 / ε)^2
+    for k in 1:n_dim
+        f = fits[k]
+        ax = Axis(fig[fld1(k, ncol), mod1(k, ncol)]; xlabel="θ", ylabel="log10 κ",
+            title="$(COORD_NAMES[k])   neg. κ: two-slope $(round(100mean(K2[k, :] .<= 0), digits=1)) %, " *
+                  "affine $(round(100mean(KA[k, :] .<= 0), digits=1)) %", titlesize=11)
+        scatter!(ax, X[k, :], logκ.(KA[k, :]); color=(:gray50, 0.35), markersize=3, label="affine (current)")
+        scatter!(ax, X[k, :], logκ.(K2[k, :]); color=(:steelblue, 0.5), markersize=3, label="two-slope")
+        hlines!(ax, [log10(lim)]; color=:red, linestyle=:dash, label="(2/ε)², ε = median stored")
+        hlines!(ax, [0.0]; color=:black, linestyle=:dot, label="κ = 1")
+        lo, hi = extrema(X[k, :])
+        lo <= f.m.θs <= hi && vlines!(ax, [f.m.θs]; color=:gray30, linestyle=:dash)
+        k in ss_idxs && vlines!(ax, [thres]; color=:red, linestyle=:dot)
+        k == 1 && axislegend(ax; position=:lt, labelsize=9, framevisible=false)
+    end
+    Label(fig[0, :], "$(fm_run_name), data $(dir_idx), iteration $(i), γ = $(round(γ, sigdigits=3)): scaled latent " *
+        "curvature κ = M⁻¹U'' per particle (κ ≤ 0 drawn at 1e-4; dashed grey: θ*, dotted red: threshold)\n" *
+        "pooled spread √(q99/q01) of κ > 0: two-slope $(round(cond_spread(K2), sigdigits=3)), " *
+        "affine $(round(cond_spread(KA), sigdigits=3)); stability limit (2/ε)² = $(round(lim, sigdigits=3))";
+        fontsize=13, font=:bold)
+    fpath = joinpath(fm_out, "curv_iter$(i).png")
+    save(fpath, fig; px_per_unit=1.5)
+    return fpath
+end
+
+# Conditional scans across the bend: for a few particles on each side of a spike-and-slab coordinate, move only that
+# coordinate over the population's range and record U (barrier) and κ (curvature) for both maps, against θ.
+function plot_scans(i, γ, logp_func, X, fits; n_per_side=5, n_grid=150, rng=StableRNG(i))
+    ks = [k for k in ss_idxs if fits[k].n_lo >= 20 && fits[k].n_hi >= 20]
+    isempty(ks) && return nothing
+    fig = Figure(size=(length(ks) * 380, 2 * 330 + 80), fontsize=11)
+    for (c, k) in enumerate(ks)
+        f, m = fits[k], fits[k].m
+        θk = X[k, :]
+        ugrid = range(minimum(f.u), maximum(f.u), length=n_grid)
+        θgrid = fmap.(Ref(m), ugrid)
+        axU = Axis(fig[1, c]; ylabel="U - U(start)  [nats]", xticklabelsvisible=false,
+            title="$(COORD_NAMES[k]): θ* = $(round(m.θs, digits=2)), ζ = $(round(m.ζ, sigdigits=2)), " *
+                  "M⁻¹ = $(round(latent_minv(f), sigdigits=3))", titlesize=11)
+        axK = Axis(fig[2, c]; xlabel="θ", ylabel="log10 κ")
+        linkxaxes!(axU, axK)
+        for (side, idx, col) in (("spike", findall(θk .<= f.cut), :darkorange), ("slab", findall(θk .> f.cut), :steelblue))
+            for j in idx[randperm(rng, length(idx))[1:n_per_side]]
+                vgh = [line_vgh(logp_func, X[:, j] .+ (θ - θk[j]) .* (1:n_dim .== k), k) for θ in θgrid]
+                v, g, h = getindex.(vgh, 1), getindex.(vgh, 2), getindex.(vgh, 3)
+                U2 = -v .- log.(dfmap.(Ref(m), ugrid))
+                UA = -v
+                U2_0 = -logp_func(X[:, j]) - log(dfmap(m, f.u[j]))
+                UA_0 = -logp_func(X[:, j])
+                lines!(axU, θgrid, U2 .- U2_0; color=(col, 0.8))
+                lines!(axU, θgrid, UA .- UA_0; color=(col, 0.5), linestyle=:dash)
+                lines!(axK, θgrid, logκ.(κ_twoslope.(Ref(f), ugrid, g, h)); color=(col, 0.8))
+                lines!(axK, θgrid, logκ.(κ_affine.(Ref(f), h)); color=(col, 0.5), linestyle=:dash)
+                scatter!(axU, [θk[j]], [0.0]; color=col, markersize=6)
+            end
+        end
+        ylims!(axU, -8, 30)
+        xlims!(axK, max(minimum(θgrid), thres - 8), maximum(θgrid))   # spike centre to the slab; axes are linked
+        hlines!(axK, [0.0]; color=:black, linestyle=:dot)
+        for ax in (axU, axK)
+            vlines!(ax, [m.θs]; color=:gray30, linestyle=:dash)
+            vlines!(ax, [thres]; color=:red, linestyle=:dot)
+        end
+    end
+    Label(fig[0, :], "$(fm_run_name), data $(dir_idx), iteration $(i), γ = $(round(γ, sigdigits=3)): conditional scans of " *
+        "one coordinate (others fixed) from $(n_per_side) spike-side (orange) and $(n_per_side) slab-side (blue) particles\n" *
+        "solid: two-slope latent potential and scaled curvature; dashed: affine (current); dots: start particles; " *
+        "κ ≤ 0 drawn at 1e-4"; fontsize=13, font=:bold)
+    fpath = joinpath(fm_out, "scan_iter$(i).png")
+    save(fpath, fig; px_per_unit=1.5)
+    return fpath
+end
+
+function plot_curv_summary(curv)
+    isempty(curv) && return nothing
+    fig = Figure(size=(1500, 300 * cld(length(curv), 2) + 60), fontsize=11)
+    for (c, r) in enumerate(curv)
+        ax = Axis(fig[fld1(c, 2), mod1(c, 2)]; yticks=(1:n_dim, COORD_NAMES), xlabel="log10 √κ (κ > 0)",
+            title="iteration $(r.i), γ = $(round(r.γ, sigdigits=3)); spread √(q99/q01): two-slope " *
+                  "$(round(cond_spread(r.K2), sigdigits=3)), affine $(round(cond_spread(r.KA), sigdigits=3))",
+            titlesize=11, yreversed=true)
+        for (K, off, col) in ((r.KA, 0.17, :gray40), (r.K2, -0.17, :steelblue))
+            for k in 1:n_dim
+                q = log10.(sqrt.(qs_pos(K[k, :], [0.01, 0.1, 0.5, 0.9, 0.99])))
+                all(isfinite, q) || continue
+                lines!(ax, [q[1], q[5]], [k + off, k + off]; color=col, linewidth=1)
+                lines!(ax, [q[2], q[4]], [k + off, k + off]; color=col, linewidth=4)
+                scatter!(ax, [q[3]], [k + off]; color=:black, markersize=5)
+            end
+        end
+        vlines!(ax, [log10(2 / r.ε)]; color=:red, linestyle=:dash)
+    end
+    Label(fig[0, :], "$(fm_run_name), data $(dir_idx): scaled curvature per coordinate (grey: affine, current; blue: " *
+        "two-slope). Thin: 1-99 %, thick: 10-90 %, dot: median; red dashed: 2/ε for the stored step size";
+        fontsize=13, font=:bold)
+    fpath = joinpath(fm_out, "curv_summary.png")
+    save(fpath, fig; px_per_unit=1.5)
+    return fpath
+end
+
 summary_cols = ["run", "path", "data", "iter", "gamma", "fit_pop", "n_fit", "coord", "coord_name", "is_ss", "slab_prop",
     "gap_occ", "theta_star", "s_low", "s_high", "zeta", "start", "flag_zeta_at_bound", "flag_theta_star_near_centre",
     "D_twoslope", "D_start", "D_affine", "D_affine_full_scale", "s_affine", "s_affine_full", "split", "n_low", "n_high",
@@ -330,6 +500,10 @@ summary_cols = ["run", "path", "data", "iter", "gamma", "fit_pop", "n_fit", "coo
     "latent_scale_low_affine", "latent_scale_high_affine", "max_inv_err"]
 summary_rows = Vector{Vector{Any}}()
 png_paths = String[]
+curv_cols = ["run", "data", "iter", "gamma", "coord", "coord_name", "map", "eps_median_stored", "stability_limit",
+    "frac_nonpositive", "q01_pos", "q10_pos", "q50_pos", "q90_pos", "q99_pos", "frac_above_limit"]
+curv_rows = Vector{Vector{Any}}()
+curv_results = []
 
 for (ii, i) in enumerate(sel_iters)
     γ = γs[i+1]
@@ -353,6 +527,28 @@ for (ii, i) in enumerate(sel_iters)
             f
         end
         push!(png_paths, plot_iteration(i, γ, fits, X[:, keep], fit_pop))
+
+        # curvature diagnostics, for the first fit population only
+        if fit_pop == fm_fit_pops[1] && !haskey(fm_flags, "no_curv")
+            logp_func = Base.Fix1(LogDensityProblems.logdensity, ldp_builder(prior_path, γ))
+            ε = median(p.stepsize for p in all_particles[i+1])
+            Xk, Gk = X[:, keep], G[:, keep]
+            t = @elapsed((K2, KA) = population_curvature(logp_func, Xk, Gk, fits))
+            @info "iter $i curvature" t ε nested_AD = NESTED_AD[] spread_twoslope = cond_spread(K2) spread_affine = cond_spread(KA)
+            push!(curv_results, (i=i, γ=γ, ε=ε, K2=K2, KA=KA))
+            for k in 1:n_dim, (map_name, K) in (("twoslope", K2), ("affine", KA))
+                push!(curv_rows, Any[fm_run_name, dir_idx, i, γ, k, COORD_NAMES[k], map_name, ε, (2 / ε)^2,
+                    mean(K[k, :] .<= 0), qs_pos(K[k, :], [0.01, 0.1, 0.5, 0.9, 0.99])..., mean(K[k, :] .> (2 / ε)^2)])
+            end
+            push!(png_paths, plot_curvature(i, γ, Xk, fits, K2, KA, ε))
+            t = @elapsed p = plot_scans(i, γ, logp_func, Xk, fits)
+            @info "iter $i scans" t
+            isnothing(p) || push!(png_paths, p)
+            open(joinpath(fm_out, "curvature.csv"), "w") do io
+                println(io, join(curv_cols, ","))
+                foreach(r -> println(io, join(r, ",")), curv_rows)
+            end
+        end
     end
     # rewrite after every iteration so partial results survive
     open(joinpath(fm_out, "summary.csv"), "w") do io
@@ -361,7 +557,11 @@ for (ii, i) in enumerate(sel_iters)
     end
 end
 
+p = plot_curv_summary(curv_results)
+isnothing(p) || push!(png_paths, p)
+
 println("\nOutputs:")
 println("  ", joinpath(fm_out, "iteration_table.csv"))
 println("  ", joinpath(fm_out, "summary.csv"))
+isempty(curv_rows) || println("  ", joinpath(fm_out, "curvature.csv"))
 foreach(p -> println("  ", p), png_paths)
