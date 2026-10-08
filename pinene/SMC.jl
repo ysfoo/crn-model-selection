@@ -188,7 +188,7 @@ end
 
 
 ## Nutpie-style mass matrix
-function compute_invmass(particles, target, npass)
+function compute_invmass(particles, target, npass, prev_pop_info=nothing)
     logp_func = Base.Fix1(LogDensityProblems.logdensity, target)
 
     x1 = particles[1].state
@@ -223,7 +223,7 @@ acc_weight(a; p=4, q=1) = isfinite(a) ? clamp(a, 0., 1.)^p * (1 - clamp(a, 0., 1
 # Particles with `curr_acc_rate < min_acc_rate` can additionally be excluded outright (disabled by default); if 
 # that would exclude everyone, the filter is ignored.
 function compute_FT_info(
-    particles, target, npass; jitter=0.2, init_jitter=0.2, min_acc_rate=0.0,
+    particles, target, npass, prev_pop_info=nothing; jitter=0.2, init_jitter=0.2, min_acc_rate=0.0,
     weight_func=acc_weight,
 )
     stepsizes = [p.stepsize for p in particles]
@@ -289,7 +289,8 @@ function fit_acc_stepsize(stepsizes, accs; acc_target=0.8, weights=nothing, min_
 end
 
 function compute_QB_info(
-    particles, target, npass; acc_target=0.8, jitter=0.2, max_dlog=Inf, use_ngrad=false, min_obs=20,
+    particles, target, npass, prev_pop_info=nothing; acc_target=0.8, jitter=0.2, max_dlog=Inf, use_ngrad=false,
+    min_obs=20,
 )
     stepsizes = [p.stepsize for p in particles]
     valid = filter(s -> isfinite(s) && s > 0, stepsizes)

@@ -247,7 +247,7 @@ end
 
 
 ## Nutpie-style mass matrix
-function compute_invmass(particles, target, npass)
+function compute_invmass(particles, target, npass, prev_pop_info=nothing)
     logp_func = Base.Fix1(LogDensityProblems.logdensity, target)
 
     x1 = particles[1].state
@@ -282,7 +282,7 @@ acc_weight(a; p=4, q=1) = isfinite(a) ? clamp(a, 0., 1.)^p * (1 - clamp(a, 0., 1
 # Particles with `curr_acc_rate < min_acc_rate` can additionally be excluded outright (disabled by default); if 
 # that would exclude everyone, the filter is ignored.
 function compute_FT_info(
-    particles, target, npass; jitter=0.2, init_jitter=0.2, min_acc_rate=0.0,
+    particles, target, npass, prev_pop_info=nothing; jitter=0.2, init_jitter=0.2, min_acc_rate=0.0,
     weight_func=acc_weight,
 )
     stepsizes = [p.stepsize for p in particles]
@@ -368,18 +368,17 @@ function qb_stepsize(particles, npass; acc_target=0.8, max_dlog=Inf, use_ngrad=f
     return stepsize
 end
 
-# The geometry (mass matrix, or maps) is estimated from the population before the first round of an SMC iteration and
-# reused in its later rounds (see `cached_geometry`); the step size is updated every round. `refit_each_pass=true`
-# re-estimates the geometry before every round, as runs before this option did.
+# The mass matrix is estimated from the population before the first round of an SMC iteration and reused from
+# `prev_pop_info` in its later rounds; the step size is updated every round. `refit_each_pass=true` re-estimates the mass
+# matrix before every round, as runs before this option did.
 function compute_QB_info(
-    particles, target, npass; acc_target=0.8, jitter=0.2, max_dlog=Inf, use_ngrad=false, min_obs=20,
-    refit_each_pass=false,
+    particles, target, npass, prev_pop_info=nothing; acc_target=0.8, jitter=0.2, max_dlog=Inf, use_ngrad=false,
+    min_obs=20, refit_each_pass=false,
 )
     stepsize = qb_stepsize(particles, npass; acc_target, max_dlog, use_ngrad, min_obs)
-    geometry = cached_geometry(:QB, target, npass, refit_each_pass) do
-        compute_invmass(particles, target, npass)
-    end
-    return merge(geometry, (stepsize = stepsize, jitter = jitter))
+    invmass = (isnothing(prev_pop_info) || refit_each_pass) ? compute_invmass(particles, target, npass).invmass :
+        prev_pop_info.invmass
+    return (invmass = invmass, stepsize = stepsize, jitter = jitter)
 end
 
 ## Population info for `nuts_transformed_move`: per-coordinate two-slope maps (transform_maps.jl) and the step size
@@ -388,47 +387,51 @@ end
 # `compute_invmass`, the 1% of particles with the lowest log target are left out of the fit. A fit whose asymptotes are
 # far from the slopes the particles see (`check_asymptotes`) falls back to the equal-slope optimum (the affine nutpie
 # map). NUTS then runs in u with the identity mass matrix, since the D-optimal maps already set the scale of each
-# coordinate. The maps are reused in later rounds of the same iteration (`refit_each_pass=true` refits them every
-# round). The step size follows `qb_stepsize`, updated every round; particles carry their step size from the previous
-# round, in latent units.
+# coordinate. The maps are reused from `prev_pop_info` in later rounds of the same iteration (`refit_each_pass=true`
+# refits them every round). The step size follows `qb_stepsize`, updated every round; particles carry their step size
+# from the previous round, in latent units.
 function compute_TQB_info(
-    particles, target, npass; acc_target=0.8, jitter=0.2, max_dlog=Inf, use_ngrad=false, min_obs=20, λN=DEFAULT_λN,
-    ζ_min=0.2, refit_each_pass=false, verbose=1,
+    particles, target, npass, prev_pop_info=nothing; acc_target=0.8, jitter=0.2, max_dlog=Inf, use_ngrad=false,
+    min_obs=20, λN=DEFAULT_λN, ζ_min=0.2, refit_each_pass=false, verbose=1,
 )
     stepsize = qb_stepsize(particles, npass; acc_target, max_dlog, use_ngrad, min_obs)
-    geometry = cached_geometry(:TQB, target, npass, refit_each_pass) do
-        # scores at the current states, as in `compute_invmass`
-        logp_func = Base.Fix1(LogDensityProblems.logdensity, target)
-        x1 = particles[1].state
-        d, n = length(x1), length(particles)
-        X, G, logp = Matrix{Float64}(undef, d, n), Matrix{Float64}(undef, d, n), Vector{Float64}(undef, n)
-        result = DiffResults.GradientResult(x1)
-        for (i, p) in enumerate(particles)
-            X[:, i] .= p.state
-            result = ForwardDiff.gradient!(result, logp_func, p.state)
-            logp[i] = DiffResults.value(result)
-            G[:, i] .= DiffResults.gradient(result)
-        end
-        keep = logp .>= quantile(logp, 0.01)   # drop bottom 1% by log target density
-
-        maps = Vector{TwoSlope}(undef, d)
-        t_fit = @elapsed for k in 1:d
-            θ, α = X[k, keep], G[k, keep]
-            f = fit_twoslope(θ, α; λ=λN / length(θ), ζ_min)
-            maps[k], reason = check_asymptotes(f.m, f.u, θ, α)
-            isempty(reason) || @warn "Two-slope fit of coordinate $k replaced by the equal-slope map" reason f.m
-        end
-        if verbose > 0
-            @info "Two-slope maps fitted (pass $npass)" t_fit
-            flush(stdout)
-        end
-        (invmass = ones(d), maps = maps)
-    end
+    maps = (isnothing(prev_pop_info) || refit_each_pass) ? fit_maps(particles, target, npass; λN, ζ_min, verbose) :
+        prev_pop_info.maps
     if verbose > 0
         @info "Step size (pass $npass)" stepsize
         flush(stdout)
     end
-    return merge(geometry, (stepsize = stepsize, jitter = jitter))
+    return (invmass = ones(length(maps)), stepsize = stepsize, jitter = jitter, maps = maps)
+end
+
+# Two-slope maps for every coordinate, fitted to the population (see `compute_TQB_info`).
+function fit_maps(particles, target, npass; λN=DEFAULT_λN, ζ_min=0.2, verbose=1)
+    # scores at the current states, as in `compute_invmass`
+    logp_func = Base.Fix1(LogDensityProblems.logdensity, target)
+    x1 = particles[1].state
+    d, n = length(x1), length(particles)
+    X, G, logp = Matrix{Float64}(undef, d, n), Matrix{Float64}(undef, d, n), Vector{Float64}(undef, n)
+    result = DiffResults.GradientResult(x1)
+    for (i, p) in enumerate(particles)
+        X[:, i] .= p.state
+        result = ForwardDiff.gradient!(result, logp_func, p.state)
+        logp[i] = DiffResults.value(result)
+        G[:, i] .= DiffResults.gradient(result)
+    end
+    keep = logp .>= quantile(logp, 0.01)   # drop bottom 1% by log target density
+
+    maps = Vector{TwoSlope}(undef, d)
+    t_fit = @elapsed for k in 1:d
+        θ, α = X[k, keep], G[k, keep]
+        f = fit_twoslope(θ, α; λ=λN / length(θ), ζ_min)
+        maps[k], reason = check_asymptotes(f.m, f.u, θ, α)
+        isempty(reason) || @warn "Two-slope fit of coordinate $k replaced by the equal-slope map" reason f.m
+    end
+    if verbose > 0
+        @info "Two-slope maps fitted (pass $npass)" t_fit
+        flush(stdout)
+    end
+    return maps
 end
 
 

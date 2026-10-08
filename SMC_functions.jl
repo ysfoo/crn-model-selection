@@ -153,22 +153,8 @@ function nuts_invmass_move(rng, particle, target, n_nuts, pop_info)
     return SMCParticle(θs[end], NaN, isfinite(logtarget) ? logtarget : -Inf, stepsize, agg_n_nuts, info)
 end
 
-# Geometry (mass matrix, maps, ...) shared by the rounds of one SMC iteration: `f()` is evaluated before the first round
-# (npass == 1) and its result reused in later rounds with the same target object (`perform_moves!` passes the same target
-# to every round of an iteration, and a new one each iteration). `kind` keeps different `compute_pop_info` functions
-# apart. With `refit_each_pass=true`, `f()` is evaluated every round. Runs on the master only.
-const _GEOMETRY_CACHE = Ref{Any}(nothing)
-function cached_geometry(f, kind, target, npass, refit_each_pass)
-    c = _GEOMETRY_CACHE[]
-    if refit_each_pass || npass == 1 || isnothing(c) || c.kind !== kind || c.target !== target
-        c = (kind = kind, target = target, geometry = f())
-        _GEOMETRY_CACHE[] = c
-    end
-    return c.geometry
-end
-
 # NUTS on the transformed target θ_k = F_k(u_k) (see transform_maps.jl), with the per-coordinate maps in `pop_info.maps`
-# (fitted to the population before the round, e.g. by `compute_TQB_info`) and the identity mass matrix in
+# (fitted to the population, e.g. by `compute_TQB_info`) and the identity mass matrix in
 # `pop_info.invmass`. The particle is mapped to u, moved by `nuts_invmass_move` on `TransformedTarget`, and mapped back.
 # The stored log target is that of θ (the latent density minus Σ log F'), `info.delta` is the θ-space change, and the
 # step size and the jump statistics (`sum_sqjdist`, `curr_esjd_per_grad`) are in latent units.
@@ -337,13 +323,16 @@ function perform_moves!(
     npass = 0
     move_time = 0.0
     last_n_nuts = nothing
+    # `compute_pop_info(particles, target, npass, prev_pop_info)` sees the previous round's result in this SMC iteration
+    # (`nothing` before the first round), e.g. to reuse its mass matrix or maps and only update the step size
+    pop_info = nothing
     while npass < max_npass
         n_nuts = n_nuts_func(particles, last_n_nuts, npass, states_before_move; verbose, rng)
         n_nuts == 0 && break
 
         npass += 1
         last_n_nuts = n_nuts
-        pop_info = compute_pop_info(particles, target, npass)
+        pop_info = compute_pop_info(particles, target, npass, pop_info)
         seeds = rand(rng, UInt64, length(particles))
 
         pbar = Progress(pop_size; desc="Iter $iter, pass $(npass)")
@@ -577,7 +566,7 @@ end
 function run_SMC(
     pop_size, target_ess, init_sampler, prior_path, ldp_builder, move_func, n_nuts_func, fname;
     init_pop_size=pop_size, init_stepsize::Float64=0.01, 
-    max_npass=10, refresh_logtarget=true, compute_pop_info=(particles, target, npass)->(;),
+    max_npass=10, refresh_logtarget=true, compute_pop_info=(particles, target, npass, prev_pop_info)->(;),
     verbose=0, vid_path=nothing, make_fig=nothing,
     parallel=:serial, pbar_lines=pop_size, rng=Random.default_rng(), max_iter=typemax(Int),
 )
@@ -642,7 +631,7 @@ end
 # Resumes a run_SMC that was interrupted, reading state from `fname``.
 function resume_SMC(
     pop_size, target_ess, prior_path, ldp_builder, move_func, n_nuts_func, fname;
-    max_npass=10, refresh_logtarget=true, compute_pop_info=(particles, target, npass)->(;),
+    max_npass=10, refresh_logtarget=true, compute_pop_info=(particles, target, npass, prev_pop_info)->(;),
     verbose=0, vid_path=nothing, make_fig=nothing,
     parallel=:serial, pbar_lines=pop_size, rng=Random.default_rng(), max_iter=typemax(Int),
 )
