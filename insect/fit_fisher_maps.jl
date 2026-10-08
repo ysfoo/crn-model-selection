@@ -34,26 +34,13 @@ empty!(ARGS); push!(ARGS, fm_pos[1])
 
 include(joinpath(@__DIR__, "SMC.jl"))   # model, data, make_ldp, ss_idxs, thres, load_SMC, ...
 
-# Run's own path: evaluate its variant script, minus `include(... SMC.jl)` and the run/resume call. Statements ending in
-# `;` are parsed as nested `:toplevel` blocks, so the filter recurses into them. Running the variant's `run_SMC` would
-# overwrite the stored run (`fname`), so refuse to evaluate if any call to it survives the filter.
-# `--variant=SMCnnn` takes the path from another variant with the same path (e.g. SMC505 for SMC501_4k, whose script is
-# gone); the log target check in `scores` confirms it reproduces the stored values.
 fm_run_str = get(fm_flags, "variant", split(fm_run_name, "_")[1])
 fm_variant = joinpath(@__DIR__, "$(fm_run_str).jl")
-let ex = Meta.parseall(read(fm_variant, String); filename=fm_variant)
-    is_skipped(e) = e isa Expr && e.head == :call && e.args[1] in (:include, :run_SMC, :resume_SMC)
-    function strip_calls!(e)
-        e isa Expr && e.head == :toplevel || return e
-        filter!(x -> !is_skipped(x), e.args)
-        foreach(strip_calls!, e.args)
-        return e
-    end
-    calls_run(e) = e isa Expr && ((e.head == :call && e.args[1] in (:run_SMC, :resume_SMC)) || any(calls_run, e.args))
-    strip_calls!(ex)
-    calls_run(ex) && error("$(fm_variant) still calls run_SMC/resume_SMC after filtering; not evaluating it")
-    Base.eval(Main, ex)
-end
+# Run's own path; `load_variant!` never evaluates the variant's run_SMC/resume_SMC call (see fisher_maps.jl).
+# `--variant=SMCnnn` takes the path from another variant with the same path (e.g. SMC505 for SMC501_4k); the log
+# target check in `scores` confirms it reproduces the stored values.
+include(joinpath(@__DIR__, "fisher_maps.jl"))
+load_variant!(fm_variant)
 const FM_PATH_NAMES = Dict('2' => "final prior (likelihood tempered only)", '3' => "moment-interpolated mixture",
                            '5' => "geometric", '4' => "Fisher-Rao (FRPath)")
 fm_path = get(FM_PATH_NAMES, fm_run_str[4], "unknown")
@@ -69,108 +56,6 @@ n_dim = length(all_particles[1][1].state)
 const COORD_NAMES = ["λ_EL", "λ_LA", "ρ", "δ_E", "δ_L", "δ_A", "κ_E", "κ_L", "κ_A", "σ"]   # order of `param_labels`
 @assert length(COORD_NAMES) == n_dim
 
-# ---------------------------------------------------------------------------------------------------------------------
-# Two-slope map
-
-struct TwoSlope
-    θs::Float64
-    slo::Float64
-    shi::Float64
-    ζ::Float64
-end
-
-fmap(m::TwoSlope, u) = m.θs + m.ζ * (m.shi * log1pexp(u / m.ζ) - m.slo * log1pexp(-u / m.ζ))
-dfmap(m::TwoSlope, u) = m.slo * logistic(-u / m.ζ) + m.shi * logistic(u / m.ζ)
-dlogdfmap(m::TwoSlope, u) = (m.shi - m.slo) * logistic(u / m.ζ) * logistic(-u / m.ζ) / (m.ζ * dfmap(m, u))
-
-# F^{-1}(θ) by safeguarded Newton inside a bracket, with bisection when a Newton step leaves the bracket.
-# F' ≥ min(s) and F(0) = θ* + ζ log 2 (s_high - s_low) give the bracket [0, (θ - F(0))/min(s)] (or its mirror).
-function finv(m::TwoSlope, θ; rtol=1e-12, maxit=200)
-    F0 = fmap(m, 0.0)
-    a, b = minmax(0.0, (θ - F0) / min(m.slo, m.shi))
-    u = θ > m.θs ? (θ - m.θs) / m.shi : (θ - m.θs) / m.slo   # inverse of the asymptotes
-    u = clamp(u, a, b)
-    tol = rtol * max(1.0, abs(θ))
-    for _ in 1:maxit
-        g = fmap(m, u) - θ
-        abs(g) <= tol && return u
-        g > 0 ? (b = u) : (a = u)
-        un = u - g / dfmap(m, u)
-        u = (a < un < b) ? un : 0.5 * (a + b)
-        b - a <= eps(max(abs(a), abs(b), 1.0)) && return u
-    end
-    return u
-end
-
-# Parameter vector p = (θ*, log s_low, log s_high, log(ζ - ζ_min)).
-to_map(p) = TwoSlope(p[1], exp(p[2]), exp(p[3]), ZETA_MIN + exp(p[4]))
-from_map(m::TwoSlope) = [m.θs, log(m.slo), log(m.shi), log(m.ζ - ZETA_MIN)]
-
-popvar(x) = var(x; corrected=false)
-
-# latent values u_n and latent scores a_n = F'(u_n) α_n + (log F')'(u_n)
-function latent(m::TwoSlope, θ, α)
-    u = finv.(Ref(m), θ)
-    a = dfmap.(Ref(m), u) .* α .+ dlogdfmap.(Ref(m), u)
-    return u, a
-end
-Dk(m::TwoSlope, θ, α) = ((u, a) = latent(m, θ, α); popvar(a .+ u))
-
-# Affine nutpie map θ = m + s u (the centre does not enter D): D = Var(s α + θ/s), minimised at s^2 = sqrt(Var θ / Var α)
-nutpie_scale(θ, α) = (popvar(θ) / max(popvar(α), eps()))^(1 / 4)
-D_affine(s, θ, α) = popvar(s .* α .+ θ ./ s)
-
-# Parts used for the split start, the flags and the per-part latent scales.
-split_point(k, θ) = k in ss_idxs ? thres : median(θ)
-
-function fit_twoslope(k, θ, α; ζ0=1.0)
-    s_glob = nutpie_scale(θ, α)
-    cut = split_point(k, θ)
-    lo, hi = θ .<= cut, θ .> cut
-    n_lo, n_hi = count(lo), count(hi)
-    # Split start: part-wise nutpie scale and centre (Seyboldt et al., Thm 2.2); a part with fewer than 20 particles
-    # takes the other part's scale.
-    slo = n_lo >= 20 ? nutpie_scale(θ[lo], α[lo]) : NaN
-    shi = n_hi >= 20 ? nutpie_scale(θ[hi], α[hi]) : NaN
-    isnan(slo) && (slo = isnan(shi) ? s_glob : shi)
-    isnan(shi) && (shi = slo)
-    mlo = n_lo >= 2 ? mean(θ[lo]) + slo^2 * mean(α[lo]) : NaN
-    mhi = n_hi >= 2 ? mean(θ[hi]) + shi^2 * mean(α[hi]) : NaN
-    d = 3 + ζ0 * abs(log(slo / shi))
-    θs = shi < slo ? mhi - shi * d : mlo + slo * d
-    isfinite(θs) || (θs = median(θ))
-
-    starts = [:split => TwoSlope(θs, slo, shi, ζ0), :affine => TwoSlope(median(θ), s_glob, s_glob, ζ0)]
-    obj(p) = (v = Dk(to_map(p), θ, α); isfinite(v) ? v : Inf)
-    best = nothing
-    for (name, m0) in starts
-        p = from_map(m0)
-        res = nothing
-        for _ in 1:3   # restart Nelder-Mead from its own optimum
-            res = optimize(obj, p, NelderMead(), Optim.Options(iterations=4000, f_reltol=1e-12, x_abstol=1e-10))
-            p = Optim.minimizer(res)
-        end
-        D = Optim.minimum(res)
-        if isnothing(best) || D < best.D
-            best = (D=D, m=to_map(p), start=name, D_start=obj(from_map(m0)))
-        end
-    end
-
-    m = best.m
-    # flags: ζ at its lower bound; θ* within 2 local sds (part-wise Fisher scale) of either part's centre
-    centres = filter(c -> isfinite(c.m), [(m=mlo, s=slo), (m=mhi, s=shi)])
-    flag_ζ = m.ζ <= ZETA_MIN + 1e-2
-    flag_θs = any(abs(m.θs - c.m) < 2c.s for c in centres)
-
-    # per-part latent scale (Var_j(u)/Var_j(a))^{1/4} for the two-slope and the affine map (≈ 1: unit curvature)
-    u2, a2 = latent(m, θ, α)
-    ua, aa = θ ./ s_glob, s_glob .* α
-    lscale(u, a, idx) = count(idx) >= 2 ? (popvar(u[idx]) / popvar(a[idx]))^(1 / 4) : NaN
-    return (; best..., cut, n_lo, n_hi, m_lo=mlo, m_hi=mhi, s_lo_part=slo, s_hi_part=shi,
-            flag_ζ, flag_θs, s_affine=s_glob, D_affine=D_affine(s_glob, θ, α),
-            ls2_lo=lscale(u2, a2, lo), ls2_hi=lscale(u2, a2, hi), lsa_lo=lscale(ua, aa, lo), lsa_hi=lscale(ua, aa, hi),
-            max_inv_err=maximum(abs.(fmap.(Ref(m), u2) .- θ)), u=u2, a=a2)
-end
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Step 3: tests
