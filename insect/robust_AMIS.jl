@@ -1,5 +1,7 @@
 include(joinpath(@__DIR__, "setup.jl"));
 include(joinpath(@__DIR__, "../AMIS_helpers.jl"));
+include(joinpath(@__DIR__, "ldp_setup.jl"));
+include(joinpath(@__DIR__, "log_helpers.jl"));
 
 # This script takes one command-line argument, which is the index of `feasible_idxs`.
 dir_idx = parse(Int64, ARGS[1])
@@ -10,20 +12,24 @@ OUTDIR = joinpath(@__DIR__, "output/data$(dir_idx)") # inference result director
 mkpath(OUTDIR)
 
 # Fetch packages.
-using Distributions, LinearAlgebra, LogExpFunctions, Optim, OrdinaryDiffEq, PDMats, PEtab, Random
+using Distributions, LinearAlgebra, LogExpFunctions, Optim, OrdinaryDiffEq, PDMats, Random
 using JLD2, ProgressMeter
-using Bijectors, LogDensityProblems, LogDensityProblemsAD
+using LogDensityProblems
 using Pathfinder, PSIS, StableRNGs
 
 @load joinpath(@__DIR__, "data.jld2") all_data;
 data = all_data[genmodel_idx];
 
 
-function robust_AMIS(target, prior_sampler, prior_means, prior_vars; 
-                    nruns=50, Kmax=50, n_out=10000)
+# `grad_target` (tolerances suitable for gradients) is used by Pathfinder, `target` by the importance sampling.
+function robust_AMIS(rng, grad_target, target, prior_sampler, prior_means, prior_vars; 
+                    nruns=50, Kmax=50, n_out=10000, io=stdout)
 
-    d = target.dim
-    @time q1_dists, em_init_dists = init_dists(target, prior_sampler, prior_means, prior_vars, nruns, Kmax, 2d)
+    d = LogDensityProblems.dimension(target)
+    # The initial proposal uses all viable Pathfinder fits (can be thousands of components); the EM initialisation uses
+    # at most Kmax spread-out ones. Using only the latter as q1 underestimated logZ for d = 9, 10 (twice the error).
+    t = @elapsed q1_dists, em_init_dists = init_dists(grad_target, prior_sampler, prior_means, prior_vars, nruns, Kmax, 2d; rng=rng, io=io)
+    println(io, "Pathfinder initialisation ($nruns runs): $(round(t; digits=2)) s, $(length(q1_dists)) components")
     K1 = length(q1_dists)
 
     n_vec = [0; round.(Int, logrange(1e4, 1e6, 16))]
@@ -47,10 +53,11 @@ function robust_AMIS(target, prior_sampler, prior_means, prior_vars;
 
         # Draw and evaluate new samples
         gm = gm_vec[end]
-        new_samples = rand(gm, n_incr)
+        new_samples = rand(rng, gm, n_incr)
         all_samples = hcat(all_samples, new_samples)
 
-        @time new_logps = target.logtarget.(eachcol(new_samples))
+        t = @elapsed new_logps = LogDensityProblems.logdensity.(Ref(target), eachcol(new_samples))
+        println(io, "  log target of $n_incr samples: $(round(t; digits=2)) s")
         new_logps[findall(isnan, new_logps)] .= -Inf
         append!(all_logps, new_logps)
 
@@ -86,14 +93,14 @@ function robust_AMIS(target, prior_sampler, prior_means, prior_vars;
 
         # Re-init mixture
         K_add = max(Kmax - gm.K, 0)
-        sample_idxs = sample(1:n_em, weights(em_ws), K_add; replace=false)
+        sample_idxs = sample(rng, 1:n_em, weights(em_ws), K_add; replace=false)
         overall_var = var(X; dims=2) |> vec
         new_prec_chol = cholesky(diagm(1 ./ overall_var))
         if iter == 1
             gm = GaussianMixture(
                 Kmax, d, fill(1/Kmax, Kmax),
-                [copy(dist.μ) for dist in em_init_dists],
-                [cholesky(inv(hermitianpart(dist.Σ))) for dist in em_init_dists], 
+                [[copy(dist.μ) for dist in em_init_dists]; [copy(X[:, idx]) for idx in sample_idxs]],
+                [[cholesky(inv(hermitianpart(dist.Σ))) for dist in em_init_dists]; [deepcopy(new_prec_chol) for _ in 1:K_add]],
             );
         else
             gm = K_add == 0 ? gm : GaussianMixture(
@@ -105,7 +112,8 @@ function robust_AMIS(target, prior_sampler, prior_means, prior_vars;
         @assert sum(gm.weights) ≈ 1.
 
         # Fit Gaussian mixture using subset of accumulated samples
-        @time log_liks = fit_gm!(gm, X; xweights=em_ws, max_iter=100)   
+        t = @elapsed log_liks = fit_gm!(gm, X; xweights=em_ws, max_iter=100)
+        println(io, "  EM fit: $(round(t; digits=2)) s")
         
         log_coefs = 2 .* all_logps .- all_logqs;
         n_cs = min(n_tot, 100000)
@@ -126,7 +134,8 @@ function robust_AMIS(target, prior_sampler, prior_means, prior_vars;
             N=n_cs, K=gm.K, log_coefs=log_coefs[cs_idxs], log_probs=log_comp_probs, intercepts=intercepts,
             offset=offset, cache=zeros(gm.K)
         );
-        @time opt_w, history, converged = cauchy_simplex(cs_obj_func, cs_grad_func!, gm.weights, cs_args; max_iter=100);
+        t = @elapsed opt_w, history, converged = cauchy_simplex(cs_obj_func, cs_grad_func!, gm.weights, cs_args; max_iter=100);
+        println(io, "  mixture weights (Cauchy simplex): $(round(t; digits=2)) s")
         
         gm.weights .= opt_w
 
@@ -134,8 +143,7 @@ function robust_AMIS(target, prior_sampler, prior_means, prior_vars;
         all_logqs_mat = vcat(all_logqs_mat, logpdf(gm_vec[end], all_samples)')
 
         @info "Iter $iter:" n_tot Zhat wESS pareto_shape
-        flush(stdout)
-        flush(stderr)
+        flush(io)
         if false
             i1 = 4
             # i2 = 3
@@ -168,10 +176,10 @@ function robust_AMIS(target, prior_sampler, prior_means, prior_vars;
     n_incr = incr_vec[end]
     prop_ws = incr_vec ./ n_tot;
     gm = gm_vec[end];
-    new_samples = rand(gm, n_incr);
+    new_samples = rand(rng, gm, n_incr);
     all_samples = hcat(all_samples, new_samples);
 
-    new_logps = target.logtarget.(eachcol(new_samples));
+    new_logps = LogDensityProblems.logdensity.(Ref(target), eachcol(new_samples));
     new_logps[findall(isnan, new_logps)] .= -Inf
     append!(all_logps, new_logps);
 
@@ -187,36 +195,43 @@ function robust_AMIS(target, prior_sampler, prior_means, prior_vars;
     return (
         incr_vec = incr_vec,
         gm_vec = gm_vec,
-        unweighted_samples = [all_samples[:,idx] for idx in stratified_sampling(exp.(psis_logws .- maximum(psis_logws)), n_out)],
+        unweighted_samples = [all_samples[:,idx] for idx in stratified_sampling(exp.(psis_logws .- maximum(psis_logws)), n_out; rng=rng)],
         psis_logws = psis_logws,
         pareto_shape = psis_res.pareto_shape
     )
 end
 
+LinearAlgebra.BLAS.set_num_threads(1)
+
 # model_idx = 63
 # begin
-for model_idx in 1:n_models 
-    println("Model $(model_idx)")
+# Progress goes to the main log, details of each model to logs/data[d]/robust_AMIS/model[m].log.
+LOGDIR = mkpath(joinpath(@__DIR__, "logs", "data$(dir_idx)", "robust_AMIS"))
+counter = Threads.Atomic{Int}(0)
+amis_summary(res) = "logZ $(round(logsumexp(res.value.psis_logws) - log(length(res.value.psis_logws)); digits=4)), khat $(round(res.value.pareto_shape; digits=3))"
+for model_idx in 1:n_models
     fname = joinpath(OUTDIR, "robust_AMIS_model$(model_idx).jld2")
-    flush(stdout); flush(stderr);
     # isfile(fname) && continue # TODO: uncomment
 
-    d = nparams[model_idx]
-    pmodel = create_petab_model(models[model_idx], data, u0);
-    petab_prob = PEtabODEProblem(pmodel; odesolver=ODESolver(Rodas5P(), verbose=false));
-    target = PEtabLogDensity(petab_prob);
-    prior_sampler = create_prior_sampler(petab_prob);
+    with_model_log(model_idx, counter, n_models; logdir=LOGDIR, summary=amis_summary) do io
+        d = nparams[model_idx]
+        grad_target = make_insect_ldp(models[model_idx], data; tol=1e-6);
+        target = make_insect_ldp(models[model_idx], data);
+        prior_sampler = create_prior_sampler(prior_dists(d));
 
-    prior_means = [fill(0.0, d-1); -1.0];
-    prior_vars = [fill(2.0^2, d-1); 1.0^2];
+        prior_means = [fill(0.0, d-1); -1.0];
+        prior_vars = [fill(2.0^2, d-1); 1.0^2];
 
-    Random.seed!(dir_idx*n_models + model_idx);
-    timed_res = @timed robust_AMIS(
-    target, prior_sampler, 
-    prior_means, prior_vars; nruns=20
-    ); 
-    @save fname timed_res
+        rng = StableRNG(hash((genmodel_idx, model_idx, "robust_AMIS")))
+        timed_res = @timed robust_AMIS(
+        rng, grad_target, target, prior_sampler, 
+        prior_means, prior_vars; nruns=20, io=io
+        ); 
+        @save fname timed_res
+        timed_res
+    end
 end
+log_failures()
 
 # exit()
 

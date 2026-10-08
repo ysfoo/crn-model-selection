@@ -2,7 +2,7 @@ include(joinpath(@__DIR__, "setup.jl"));
 include(joinpath(@__DIR__, "../plot_helpers.jl"));
 
 # Fetch packages.
-using Distributions, LinearAlgebra, LogExpFunctions, Optim, OrdinaryDiffEq, PDMats, PEtab, Random
+using Distributions, LinearAlgebra, LogExpFunctions, Optim, OrdinaryDiffEq, PDMats, Random
 using JLD2, ProgressMeter, Suppressor
 using Bijectors, LogDensityProblems, LogDensityProblemsAD
 using AdvancedHMC, Bijectors, BridgeSampling, LogDensityProblems, LogDensityProblemsAD, MCMCChains, PSIS, Turing
@@ -28,7 +28,7 @@ for model_idx in [64]
     d = nparams[model_idx]
     ps = parameters(models[model_idx])
     
-    mcmc_fname = joinpath(OUTDIR, "chains7000_model$(model_idx).jld2")
+    mcmc_fname = joinpath(OUTDIR, "chains_8k_model$(model_idx).jld2")
     @nowarn_load mcmc_fname chn
     trace = permutedims(chn.value[:,1:d,:].data, [2, 1, 3]);
     samples = reshape(trace, d, :);
@@ -137,7 +137,7 @@ end
     d = nparams[model_idx]
     ps = parameters(models[model_idx])
     
-    mcmc_fname = joinpath(OUTDIR, "chains_model$(model_idx).jld2")
+    mcmc_fname = joinpath(OUTDIR, "chains_8k_model$(model_idx).jld2")
     @nowarn_load mcmc_fname chn
     trace = permutedims(chn.value[:,1:d,:].data, [2, 1, 3]);
     X = reshape(trace, d, :);

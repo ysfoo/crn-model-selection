@@ -1,5 +1,7 @@
 include(joinpath(@__DIR__, "setup.jl"));
 include(joinpath(@__DIR__, "../AMIS_helpers.jl"));
+include(joinpath(@__DIR__, "ldp_setup.jl"));
+include(joinpath(@__DIR__, "log_helpers.jl"));
 
 # This script takes one command-line argument, which is the index of `feasible_idxs`.
 dir_idx = parse(Int64, ARGS[1])
@@ -7,9 +9,9 @@ dir_idx = parse(Int64, ARGS[1])
 genmodel_idx = feasible_idxs[dir_idx]
 
 # Fetch packages.
-using Distributions, LinearAlgebra, LogExpFunctions, Optim, OrdinaryDiffEq, PDMats, PEtab, Random
-using JLD2, ProgressMeter
-using Bijectors, LogDensityProblems, LogDensityProblemsAD
+using Distributions, LinearAlgebra, LogExpFunctions, Optim, OrdinaryDiffEq, PDMats, Random
+using JLD2, ProgressMeter, StableRNGs
+using LogDensityProblems
 using Pathfinder, PSIS
 
 @load joinpath(@__DIR__, "data.jld2") all_data;
@@ -20,8 +22,8 @@ OUTDIR = joinpath(@__DIR__, "output", "data$(dir_idx)") # output directory
 @load "$OUTDIR/MAP_hess.jld2" MAP_hessians;
 
 
-function orig_AMIS(target, MAP, hess; Kmax=50, df=4, n_out=10000)
-    d = target.dim
+function orig_AMIS(rng, target, MAP, hess; Kmax=50, df=4, n_out=10000, io=stdout)
+    d = LogDensityProblems.dimension(target)
     Σ = inv(PDMat(hermitianpart!(hess)))
     q_init = MvTDist(df, MAP, Σ)
 
@@ -47,13 +49,14 @@ function orig_AMIS(target, MAP, hess; Kmax=50, df=4, n_out=10000)
         # Draw and evaluate new samples
         gm = gm_vec[end]
         if iter == 1
-            new_samples = rand(q_init, n_incr)
+            new_samples = rand(rng, q_init, n_incr)
         else
-            new_samples = rand(gm, n_incr)
+            new_samples = rand(rng, gm, n_incr)
         end
         all_samples = hcat(all_samples, new_samples)
 
-        @time new_logps = target.logtarget.(eachcol(new_samples))
+        t = @elapsed new_logps = LogDensityProblems.logdensity.(Ref(target), eachcol(new_samples))
+        println(io, "  log target of $n_incr samples: $(round(t; digits=2)) s")
         new_logps[findall(isnan, new_logps)] .= -Inf
         append!(all_logps, new_logps)
 
@@ -86,7 +89,7 @@ function orig_AMIS(target, MAP, hess; Kmax=50, df=4, n_out=10000)
         
         # Re-init mixture
         K_add = Kmax - gm.K
-        sample_idxs = sample(1:n_em, weights(em_ws), K_add; replace=false)
+        sample_idxs = sample(rng, 1:n_em, weights(em_ws), K_add; replace=false)
         overall_var = var(X; dims=2) |> vec
         new_prec_chol = cholesky(diagm(1 ./ overall_var))
         gm = K_add == 0 ? deepcopy(gm) : GaussianMixture(
@@ -97,22 +100,24 @@ function orig_AMIS(target, MAP, hess; Kmax=50, df=4, n_out=10000)
         @assert sum(gm.weights) ≈ 1.
 
         # Fit Gaussian mixture using subset of accumulated samples
-        @time log_liks = fit_gm!(gm, X; xweights=em_ws, max_iter=100)        
+        t = @elapsed log_liks = fit_gm!(gm, X; xweights=em_ws, max_iter=100)
+        println(io, "  EM fit: $(round(t; digits=2)) s")
 
         push!(gm_vec, trim_gm(gm, 1e-4))
         all_logqs_mat = vcat(all_logqs_mat, logpdf(gm_vec[end], all_samples)')
 
         @info "Iter $iter:" n_tot Zhat wESS psis_res.pareto_shape
+        flush(io)
     end
 
     n_tot = sum(incr_vec);
     n_incr = incr_vec[end]
     prop_ws = incr_vec ./ n_tot;
     gm = gm_vec[end];
-    new_samples = rand(gm, n_incr);
+    new_samples = rand(rng, gm, n_incr);
     all_samples = hcat(all_samples, new_samples);
 
-    new_logps = target.logtarget.(eachcol(new_samples));
+    new_logps = LogDensityProblems.logdensity.(Ref(target), eachcol(new_samples));
     new_logps[findall(isnan, new_logps)] .= -Inf
     append!(all_logps, new_logps);
 
@@ -130,34 +135,39 @@ function orig_AMIS(target, MAP, hess; Kmax=50, df=4, n_out=10000)
     return (
         incr_vec = incr_vec,
         gm_vec = gm_vec,
-        unweighted_samples = [all_samples[:,idx] for idx in stratified_sampling(exp.(psis_logws .- maximum(psis_logws)), n_out)],
+        unweighted_samples = [all_samples[:,idx] for idx in stratified_sampling(exp.(psis_logws .- maximum(psis_logws)), n_out; rng=rng)],
         psis_logws = psis_logws,
         pareto_shape = psis_res.pareto_shape
     )
 end
 
+LinearAlgebra.BLAS.set_num_threads(1)
+
 # model_idx = 63
 # begin
-for model_idx in 1:n_models 
-    println("Model $(model_idx)")
+# Progress goes to the main log, details of each model to logs/data[d]/orig_AMIS/model[m].log.
+LOGDIR = mkpath(joinpath(@__DIR__, "logs", "data$(dir_idx)", "orig_AMIS"))
+counter = Threads.Atomic{Int}(0)
+amis_summary(res) = "logZ $(round(logsumexp(res.value.psis_logws) - log(length(res.value.psis_logws)); digits=4)), khat $(round(res.value.pareto_shape; digits=3))"
+for model_idx in 1:n_models
     fname = joinpath(OUTDIR, "orig_AMIS_model$(model_idx).jld2")
-    flush(stdout); flush(stderr);
     # isfile(fname) && continue
 
-    d = nparams[model_idx]
-    pmodel = create_petab_model(models[model_idx], data, u0);
-    petab_prob = PEtabODEProblem(pmodel; odesolver=ODESolver(Rodas5P(), verbose=false));
-    target = PEtabLogDensity(petab_prob);
-    prior_sampler = create_prior_sampler(petab_prob);
-    MAP = collect(model_fits[model_idx].xmin)
-    hess = MAP_hessians[model_idx]
+    with_model_log(model_idx, counter, n_models; logdir=LOGDIR, summary=amis_summary) do io
+        d = nparams[model_idx]
+        target = make_insect_ldp(models[model_idx], data);
+        MAP = collect(model_fits[model_idx].xmin)
+        hess = MAP_hessians[model_idx]
 
-    Random.seed!(dir_idx*n_models + model_idx);
-    timed_res = @timed orig_AMIS(
-        target, MAP, hess
-    ); 
-    @save fname timed_res
+        rng = StableRNG(hash((genmodel_idx, model_idx, "orig_AMIS")))
+        timed_res = @timed orig_AMIS(
+            rng, target, MAP, hess; io=io
+        ); 
+        @save fname timed_res
+        timed_res
+    end
 end
+log_failures()
 
 # exit()
 

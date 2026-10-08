@@ -1,7 +1,7 @@
 include(joinpath(@__DIR__, "setup.jl"));
 
 # Fetch packages.
-using Distributions, LinearAlgebra, LogExpFunctions, Optim, OrdinaryDiffEq, PDMats, PEtab, Random
+using Distributions, LinearAlgebra, LogExpFunctions, Optim, OrdinaryDiffEq, PDMats, Random
 using JLD2, ProgressMeter, Suppressor
 
 include(joinpath(@__DIR__, "../plot_helpers.jl"));

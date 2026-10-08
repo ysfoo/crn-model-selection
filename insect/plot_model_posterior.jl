@@ -5,7 +5,7 @@ include(joinpath(@__DIR__, "../gaussian_mixtures.jl"));
 include(joinpath(@__DIR__, "../plot_helpers.jl"));
 
 # Fetch packages.
-using Distributions, LinearAlgebra, LogExpFunctions, Optim, OrdinaryDiffEq, PDMats, PEtab, Random, SymbolicIndexingInterface
+using Distributions, LinearAlgebra, LogExpFunctions, Optim, OrdinaryDiffEq, PDMats, Random, SymbolicIndexingInterface
 using JLD2, ProgressMeter, Suppressor
 using Bijectors, LogDensityProblems, LogDensityProblemsAD
 using Pathfinder, PSIS, StableRNGs, BridgeSampling
@@ -27,7 +27,7 @@ else
 
         for model_idx in 1:n_models
             d = nparams[model_idx]
-            chains_fname = "$OUTDIR/chains_model$model_idx.jld2"
+            chains_fname = "$OUTDIR/chains_8k_model$model_idx.jld2"
             @load chains_fname chn
             trace = permutedims(chn.value[:,1:d,:].data, [2, 1, 3]);
             X = reshape(trace, d, :);
@@ -66,8 +66,6 @@ else
         @load "$OUTDIR/MAP_hess.jld2" hess_times;
         genmodel_idx = feasible_idxs[dir_idx]
         data = all_data[genmodel_idx];
-        petab_models = [create_petab_model(model, data, u0) for model in models];
-        petab_probs = [PEtabODEProblem(pmodel; odesolver=ODESolver(Rodas5P(), verbose=false)) for pmodel in petab_models];
 
         MAP_time += sum(fit_times) / 60
         hess_time += sum(hess_times) / 60
@@ -76,7 +74,7 @@ else
             xmin = model_fits[model_idx].xmin;
             fmin = model_fits[model_idx].fmin;
             n_t = length(data.t);
-            logp_BIC = -fmin -petab_probs[model_idx].prior(collect(xmin)) - 0.5nparams[model_idx]*log(n_t)
+            logp_BIC = model_fits[model_idx].loglik - 0.5nparams[model_idx]*log(n_t)
             push!(BIC_logZvecs[dir_idx], logp_BIC)
 
             fname = "$OUTDIR/laplace_IS_model$model_idx.jld2"
@@ -103,11 +101,11 @@ else
             logp_rAMIS = logsumexp(logws) - log(N)
             push!(rAMIS_logZvecs[dir_idx], logp_rAMIS)
 
-            fname = "$OUTDIR/chains_model$model_idx.jld2"
+            fname = "$OUTDIR/chains_8k_model$model_idx.jld2"
             @load fname chn
             chains_time += MCMCChains.compute_duration(chn) / 60
 
-            fname = "$OUTDIR/BS_model$model_idx.jld2"
+            fname = "$OUTDIR/BS_8k_model$model_idx.jld2"
             @load fname timed_res
             BS_time += timed_res.time / 60
             push!(BS_logZvecs[dir_idx], timed_res.value.value)
@@ -315,7 +313,7 @@ end
 #             model_idx = to_plot[ax_i]
 
 #             BS_all_params = Vector{Float64}[];
-#             mcmc_fname = joinpath(OUTDIR, "chains_model$(model_idx).jld2");
+#             mcmc_fname = joinpath(OUTDIR, "chains_8k_model$(model_idx).jld2");
 #             d = nparams[model_idx]
 #             @load mcmc_fname chn;
 #             trace = permutedims(chn.value[:,1:d,:].data, [2, 1, 3]);
@@ -396,7 +394,7 @@ end
 # model_idx = genmodel_idx = feasible_idxs[dir_idx];
 # OUTDIR = joinpath(@__DIR__, "output/data$(dir_idx)");
 
-# fname = joinpath(OUTDIR, "chains_model$(genmodel_idx).jld2");
+# fname = joinpath(OUTDIR, "chains_8k_model$(genmodel_idx).jld2");
 # @load fname chn;
 # describe(chn)
 # [exp10.(mean(chn).nt.mean) tuned_params[genmodel_idx]]

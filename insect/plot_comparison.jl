@@ -5,7 +5,7 @@ include(joinpath(@__DIR__, "../gaussian_mixtures.jl"));
 include(joinpath(@__DIR__, "../plot_helpers.jl"));
 
 # Fetch packages.
-using Distributions, LinearAlgebra, LogExpFunctions, Optim, OrdinaryDiffEq, PDMats, PEtab, Random
+using Distributions, LinearAlgebra, LogExpFunctions, Optim, OrdinaryDiffEq, PDMats, Random
 using JLD2, ProgressMeter, Suppressor
 using Bijectors, LogDensityProblems, LogDensityProblemsAD
 using Pathfinder, PSIS, StableRNGs, BridgeSampling
@@ -15,7 +15,7 @@ using AdvancedHMC, Bijectors, LinearAlgebra, LogDensityProblems, LogDensityProbl
 
 # Posterior variance
 vrats_fname = joinpath(@__DIR__, "output/var_ratios.jld2");
-LOAD_VAR_RATIOS = true;
+LOAD_VAR_RATIOS = false;
 if LOAD_VAR_RATIOS
     @load vrats_fname var_ratios
 else
@@ -26,7 +26,7 @@ else
 
         for model_idx in 1:n_models
             d = nparams[model_idx]
-            chains_fname = "$OUTDIR/chains7000_model$model_idx.jld2"
+            chains_fname = "$OUTDIR/chains_8k_model$model_idx.jld2"
             @load chains_fname chn
             trace = permutedims(chn.value[:,1:d,:].data, [2, 1, 3]);
             X = reshape(trace, d, :);
@@ -56,7 +56,7 @@ begin
 
     model_idx = 41
     d = nparams[model_idx]
-    chains_fname = "$OUTDIR/chains7000_model$model_idx.jld2"
+    chains_fname = "$OUTDIR/chains_8k_model$model_idx.jld2"
     @load chains_fname chn    
     trace = permutedims(chn.value[:,1:d,:].data, [2, 1, 3]);
     X = reshape(trace, d, :);
@@ -90,7 +90,7 @@ end
 
 # Importance sampling effective sample sizes
 ess_fname = joinpath(@__DIR__, "output/ess.jld2");
-LOAD_ESS = true
+LOAD_ESS = false
 if LOAD_ESS
     @load ess_fname LIS_essmat orig_essmat rAMIS_essmat rAMIS_khatmat
 else
@@ -119,7 +119,7 @@ else
 end
 
 MCMCstats_fname = joinpath(@__DIR__, "output/MCMCstats.jld2");
-LOAD_MCMCSTATS = true;
+LOAD_MCMCSTATS = false;
 if LOAD_MCMCSTATS
     @load MCMCstats_fname MCMC_miness MCMC_maxrhat MCMC_times
 else
@@ -129,7 +129,7 @@ else
     @showprogress for dir_idx in 1:n_feasible
         OUTDIR = joinpath(@__DIR__, "output/data$(dir_idx)")
         for model_idx in 1:n_models
-            fname = joinpath(OUTDIR, "chains7000_model$(model_idx).jld2");
+            fname = joinpath(OUTDIR, "chains_8k_model$(model_idx).jld2");
             @load fname chn ess_df
             push!(MCMC_miness[dir_idx], minimum(ess_df.nt.ess))
             push!(MCMC_maxrhat[dir_idx], maximum(rhat(chn).nt.rhat))
@@ -162,7 +162,7 @@ end
 
 # OUTDIR = joinpath(@__DIR__, "output/data25")
 # for model_idx in 1:n_models
-#     fname = joinpath(OUTDIR, "chains7000_model$(model_idx).jld2");
+#     fname = joinpath(OUTDIR, "chains_8k_model$(model_idx).jld2");
 #     @load fname chn
 #     display(chn.info.stop_time .- chn.info.start_time)
 #     display(diff(sort(chn.info.start_time)))
@@ -175,7 +175,7 @@ end
 
 logZs_fname = joinpath(@__DIR__, "output/logZs.jld2");
 
-LOAD_LOGZS = true
+LOAD_LOGZS = false
 if LOAD_LOGZS
     @load logZs_fname all_times BIC_logZvecs LIS_logZvecs orig_logZvecs rAMIS_logZvecs BS_logZvecs
 else
@@ -200,8 +200,6 @@ else
         @load "$OUTDIR/MAP_hess.jld2" hess_times;
         genmodel_idx = feasible_idxs[dir_idx]
         data = all_data[genmodel_idx];
-        petab_models = [create_petab_model(model, data, u0) for model in models];
-        petab_probs = [PEtabODEProblem(pmodel; odesolver=ODESolver(Rodas5P(), verbose=false)) for pmodel in petab_models];
 
         MAP_time += sum(fit_times) / 60
         hess_time += sum(hess_times) / 60
@@ -210,7 +208,7 @@ else
             xmin = model_fits[model_idx].xmin;
             fmin = model_fits[model_idx].fmin;
             n_t = length(data.t);
-            logp_BIC = -fmin -petab_probs[model_idx].prior(collect(xmin)) - 0.5nparams[model_idx]*log(n_t)
+            logp_BIC = model_fits[model_idx].loglik - 0.5nparams[model_idx]*log(n_t)
             push!(BIC_logZvecs[dir_idx], logp_BIC)
 
             fname = "$OUTDIR/laplace_IS_model$model_idx.jld2"
@@ -237,11 +235,11 @@ else
             logp_rAMIS = logsumexp(logws) - log(N)
             push!(rAMIS_logZvecs[dir_idx], logp_rAMIS)
 
-            fname = "$OUTDIR/chains7000_model$model_idx.jld2"
+            fname = "$OUTDIR/chains_8k_model$model_idx.jld2"
             @load fname chn
             chains_time += MCMCChains.compute_duration(chn) / 60
 
-            fname = "$OUTDIR/BSnew_model$model_idx.jld2"
+            fname = "$OUTDIR/BS_8k_model$model_idx.jld2"
             @load fname timed_res
             BS_time += timed_res.time / 60
             push!(BS_logZvecs[dir_idx], timed_res.value.value)
@@ -1155,7 +1153,7 @@ hist(map(sum, all_times ./ 60))
 
 
 OUTDIR = joinpath(@__DIR__, "output/data1");
-fname = joinpath(OUTDIR, "chains_model1.jld2");
+fname = joinpath(OUTDIR, "chains_8k_model1.jld2");
 @load fname chn;
 rhat(chn)
 rhat(chn).nt.rhat

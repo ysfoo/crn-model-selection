@@ -27,14 +27,14 @@ end
 - `K::Int`: Number of mixture components
 - `method::Symbol`: Initialization method (:random or :kmeans_pp)
 """
-function initialize_gm(X::Matrix{Float64}, K::Int; method::Symbol=:kmeans_pp)
+function initialize_gm(X::Matrix{Float64}, K::Int; method::Symbol=:kmeans_pp, rng=Random.default_rng())
     d, N = size(X)
     
     # Initialize means
     if method == :kmeans_pp
-        means = kmeans_pp_init(X, K)
+        means = kmeans_pp_init(X, K; rng=rng)
     elseif method == :random
-        idxs = randperm(N)[1:K]
+        idxs = randperm(rng, N)[1:K]
         means = [X[:, i] for i in idxs]
     else
         throw(ArgumentError("method must be :random or :kmeans_pp"))
@@ -54,9 +54,9 @@ end
 """
 Add Gaussian components to an existing mixture with randomly sampled means.
 """
-function augment_gm(gm::GaussianMixture, X::Matrix{Float64}, K_add::Int)
+function augment_gm(gm::GaussianMixture, X::Matrix{Float64}, K_add::Int; rng=Random.default_rng())
     d, N = size(X)
-    idxs = randperm(N)[1:K_add]
+    idxs = randperm(rng, N)[1:K_add]
     new_means = [X[:, i] for i in idxs]
 
     # Initialize with spherical covariances
@@ -72,12 +72,12 @@ function augment_gm(gm::GaussianMixture, X::Matrix{Float64}, K_add::Int)
 end
 
 
-function reset_gm!(gm::GaussianMixture, X::Matrix{Float64}, kvec::AbstractVector{Int})
+function reset_gm!(gm::GaussianMixture, X::Matrix{Float64}, kvec::AbstractVector{Int}; rng=Random.default_rng())
     d, N = size(X)
     K_reset = length(kvec)
 
     # Randomly select means from X
-    idxs = randperm(N)[1:K_reset]
+    idxs = randperm(rng, N)[1:K_reset]
     for (i, k) in zip(idxs, kvec)
         gm.means[k] .= X[:, i]
     end
@@ -101,7 +101,8 @@ end
 K-means++ initialization for cluster centers.
 """
 function kmeans_pp_init(X::AbstractMatrix{Float64}, K::Int; 
-                        init_means::AbstractVector{Vector{Float64}}=Vector{Float64}[]
+                        init_means::AbstractVector{Vector{Float64}}=Vector{Float64}[],
+                        rng=Random.default_rng()
 )
     d, N = size(X)
     means = Vector{Float64}[]
@@ -119,7 +120,7 @@ function kmeans_pp_init(X::AbstractMatrix{Float64}, K::Int;
         end
     else 
         # First center chosen uniformly at random, distances are updated at the start of for loop below
-        push!(means, X[:, rand(1:N)])
+        push!(means, X[:, rand(rng, 1:N)])
     end
 
     for k in (length(means)+1):K
@@ -130,7 +131,7 @@ function kmeans_pp_init(X::AbstractMatrix{Float64}, K::Int;
         
         # Sample next center
         sample_weights = StatsBase.weights(dists ./ sum(dists))
-        idx = sample(1:N, sample_weights)
+        idx = sample(rng, 1:N, sample_weights)
         push!(means, X[:, idx])
     end
     
@@ -138,24 +139,40 @@ function kmeans_pp_init(X::AbstractMatrix{Float64}, K::Int;
 end
 
 
+# Samples are processed in blocks of GM_BLOCK columns, with one BLAS-3 call per block, instead of one BLAS-2 call per
+# sample: OpenBLAS serialises concurrent calls through a global lock in its buffer allocator, so per-sample calls from
+# several threads are many times slower than on one thread.
+const GM_BLOCK = 512
+
 """
 Compute log PDF of multivariate normal in-place.
+`diff_tmp` is unused (kept for compatibility with existing calls).
 """
-function log_mvn_pdf!(result::AbstractVector{Float64}, X::AbstractMatrix{Float64}, 
-                      μ::Vector{Float64}, chol::Cholesky{Float64, Matrix{Float64}}, 
-                      diff_tmp::Vector{Float64}; quadform_only::Bool=false)
+function log_mvn_pdf!(result::AbstractVector{Float64}, X::AbstractMatrix{Float64},
+                      μ::Vector{Float64}, chol::Cholesky{Float64, Matrix{Float64}},
+                      diff_tmp::Vector{Float64}=Float64[]; quadform_only::Bool=false)
     d, N = size(X)
     log_det = logdet(chol)
     const_term = quadform_only ? 0. : 0.5 * (-d * log(2π) + log_det)
-    
-    for i in 1:N
-        @inbounds for j in 1:d
-            diff_tmp[j] = X[j, i] - μ[j]
+    U = chol.U
+    buf = Matrix{Float64}(undef, d, min(GM_BLOCK, N))
+
+    for i0 in 1:GM_BLOCK:N
+        i1 = min(i0 + GM_BLOCK - 1, N)
+        B = view(buf, :, 1:(i1 - i0 + 1))
+        @inbounds for (c, i) in enumerate(i0:i1), j in 1:d
+            B[j, c] = X[j, i] - μ[j]
         end
-        lmul!(chol.U, diff_tmp)   
-        mahal_sq = dot(diff_tmp, diff_tmp)
-        result[i] = const_term - 0.5 * mahal_sq
+        lmul!(U, B)
+        @inbounds for (c, i) in enumerate(i0:i1)
+            mahal_sq = 0.
+            @simd for j in 1:d
+                mahal_sq += B[j, c]^2
+            end
+            result[i] = const_term - 0.5 * mahal_sq
+        end
     end
+    return result
 end
 
 
@@ -229,34 +246,33 @@ function m_step!(gm::GaussianMixture, X::AbstractMatrix{Float64},
     end
     
     # Update means
+    r = Vector{Float64}(undef, N)
     for k in 1:K
         is_fixed[k] && continue
         Nk[k] == 0. && continue
-        fill!(gm.means[k], 0.)
-        for i in 1:N
-            r = responsibilities[k, i]
-            @inbounds for j in 1:d
-                gm.means[k][j] += r * X[j, i]
-            end
-        end
+        copyto!(r, view(responsibilities, k, :))
+        mul!(gm.means[k], X, r)
         gm.means[k] ./= Nk[k]
     end
-    
-    # Update covariances
+
+    # Update covariances, accumulating blocks of weighted outer products by gemm (see GM_BLOCK)
+    D = Matrix{Float64}(undef, d, min(GM_BLOCK, N))
+    Dw = similar(D)
     for k in 1:K
         is_fixed[k] && continue
+        μ = gm.means[k]
         copyto!(cov_tmp, pen_cov)
         cov_tmp .*= 2 * pen_weight
-        for i in 1:N
-            r = responsibilities[k, i]
-            @inbounds for j in 1:d
-                diff_tmp[j] = X[j, i] - gm.means[k][j]
+        copyto!(r, view(responsibilities, k, :))
+        for i0 in 1:GM_BLOCK:N
+            i1 = min(i0 + GM_BLOCK - 1, N)
+            Db = view(D, :, 1:(i1 - i0 + 1))
+            Dwb = view(Dw, :, 1:(i1 - i0 + 1))
+            @inbounds for (c, i) in enumerate(i0:i1), j in 1:d
+                Db[j, c] = X[j, i] - μ[j]
+                Dwb[j, c] = r[i] * Db[j, c]
             end
-            @inbounds for j1 in 1:d
-                @inbounds for j2 in 1:d
-                    cov_tmp[j1, j2] += r * diff_tmp[j1] * diff_tmp[j2]
-                end
-            end
+            mul!(cov_tmp, Dwb, Db', 1., 1.)
         end
         cov_tmp ./= Nk[k] + 2 * pen_weight
         
@@ -378,43 +394,63 @@ end
 import Base.rand
 import Distributions.logpdf
 
-function randmvn!(v::AbstractVector{Float64}, μ::AbstractVector{Float64}, prec_chol::Cholesky{Float64, Matrix{Float64}})
-    randn!(v)
+function randmvn!(rng::AbstractRNG, v::AbstractVector{Float64}, μ::AbstractVector{Float64}, prec_chol::Cholesky{Float64, Matrix{Float64}})
+    randn!(rng, v)
     ldiv!(prec_chol.U, v)
     v .+= μ
     return v
 end
+randmvn!(v::AbstractVector{Float64}, μ::AbstractVector{Float64}, prec_chol::Cholesky{Float64, Matrix{Float64}}) =
+    randmvn!(Random.default_rng(), v, μ, prec_chol)
 
-function rand(gm::GaussianMixture, n::Int; stratified=false)
-    ks = stratified ? stratified_sampling(gm.weights, n) : sample(1:gm.K, weights(gm.weights), n)
-    return rand(gm, ks)
+function rand(rng::AbstractRNG, gm::GaussianMixture, n::Int; stratified=false)
+    ks = stratified ? stratified_sampling(gm.weights, n; rng=rng) : sample(rng, 1:gm.K, weights(gm.weights), n)
+    return rand(rng, gm, ks)
 end
 
-function rand(gm::GaussianMixture, ks::AbstractVector{Int})
+# Same draws as calling randmvn! for each sample in turn: the standard normals are generated column by column in the
+# original order, then the samples of each component are transformed with one BLAS-3 call (see GM_BLOCK).
+function rand(rng::AbstractRNG, gm::GaussianMixture, ks::AbstractVector{Int})
     n = length(ks)
     samples = zeros(gm.d, n)
-    for (i, k) in enumerate(ks)
-        randmvn!(view(samples, :, i), gm.means[k], gm.chols[k])
+    for i in 1:n
+        randn!(rng, view(samples, :, i))
+    end
+    for k in 1:gm.K
+        idxs = findall(==(k), ks)
+        isempty(idxs) && continue
+        Z = samples[:, idxs]
+        ldiv!(gm.chols[k].U, Z)
+        samples[:, idxs] .= Z .+ gm.means[k]
     end
     return samples
 end
 
+rand(gm::GaussianMixture, n::Int; stratified=false) = rand(Random.default_rng(), gm, n; stratified=stratified)
+rand(gm::GaussianMixture, ks::AbstractVector{Int}) = rand(Random.default_rng(), gm, ks)
+
+# The log-sum-exp over components is accumulated one component at a time (running maximum and scaled sum per sample),
+# so memory is O(N) rather than K x N; the initial proposal of robust AMIS can have thousands of components.
 function logpdf(gm::GaussianMixture, X::AbstractMatrix{Float64})
     d, N = size(X)
-    diff_tmp = zeros(d)
-    log_probs = zeros(gm.K, N)
-    for k in 1:gm.K        
-        if gm.weights[k] == 0.
-            log_probs[k, :] .= -Inf
-            continue
-        end
-        log_mvn_pdf!(view(log_probs, k, :), X, gm.means[k], gm.chols[k], diff_tmp)        
+    log_probs = zeros(N)
+    run_max = fill(-Inf, N)
+    run_sum = zeros(N)
+    for k in 1:gm.K
+        gm.weights[k] == 0. && continue
+        log_mvn_pdf!(log_probs, X, gm.means[k], gm.chols[k])
         lwk = log(gm.weights[k])
         @inbounds for i in 1:N
-            log_probs[k, i] += lwk
+            lp = log_probs[i] + lwk
+            if lp > run_max[i]
+                run_sum[i] = run_sum[i] * exp(run_max[i] - lp) + 1.
+                run_max[i] = lp
+            elseif lp > -Inf
+                run_sum[i] += exp(lp - run_max[i])
+            end
         end
     end
-    return vec(logsumexp(log_probs; dims=1))
+    return run_max .+ log.(run_sum)
 end
 
 

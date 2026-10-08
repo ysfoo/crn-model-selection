@@ -1,5 +1,7 @@
 # Run setup.jl.
 include(joinpath(@__DIR__, "setup.jl"));
+include(joinpath(@__DIR__, "ldp_setup.jl"));
+include(joinpath(@__DIR__, "log_helpers.jl"));
 
 # This script takes one command-line argument, which is the index of `feasible_idxs`.
 dir_idx = parse(Int64, ARGS[1])
@@ -11,57 +13,44 @@ OUTDIR = mkpath(joinpath(@__DIR__, "output", "data$(dir_idx)")) # output directo
 LOAD_MAP = false;
 
 # Fetch packages.
-using PEtab, OrdinaryDiffEq, Optim
-using JLD2, ProgressMeter, Random, Suppressor
+using OrdinaryDiffEq, Optim
+using JLD2, Random, StableRNGs, Suppressor
+
+LinearAlgebra.BLAS.set_num_threads(1)
 
 @load joinpath(@__DIR__, "data.jld2") all_data;
 
-const DEFAULT_OPT = Optim.Options(iterations = 1000, show_trace = false, show_warnings = false,
-                                  allow_f_increases = true, successive_f_tol = 3,
-                                  f_reltol = 1e-8, g_tol = 1e-6, x_abstol = 0.0)
-
-# Perform inference for a PEtabODEProblem.
-function fit_petab_prob(petab_prob)
-    return calibrate_multistart(
-        petab_prob, BFGS(linesearch = Optim.BackTracking()), 10; 
-        sample_prior=true, options=DEFAULT_OPT
-    )
-end
-
-# Fits all models sequentially to one dataset.
+# Fits all models to one dataset.
 data = all_data[genmodel_idx];
-petab_models = [create_petab_model(model, data, u0) for model in models];
-petab_probs = [PEtabODEProblem(pmodel; odesolver=ODESolver(Rodas5P(), verbose=false)) for pmodel in petab_models];
-shuffle_perm = randperm(length(petab_probs)) # shuffle probs to get more accurate time estimate
+model_order = 1:n_models
 
 if LOAD_MAP
     @load "$OUTDIR/MAP.jld2" model_fits
-    # compute optimised value to properly "initialise" PEtabProb
-    nllhs = [petab_prob.nllh(model_fit.xmin) for (petab_prob, model_fit) in zip(petab_probs, model_fits)];
 else
-    fit_times = zeros(length(petab_probs))
-    shuffled_model_fits = @showprogress [
-        begin
-            t0 = time_ns()
-            model_fit = fit_petab_prob(petab_probs[i])
-            fit_times[i] = (time_ns() - t0)/1e9     
-            model_fit
-        end for i in shuffle_perm
-    ]
-    model_fits = shuffled_model_fits[invperm(shuffle_perm)] # unshuffle
-    nllhs = [petab_prob.nllh(model_fit.xmin; prior=false) for (petab_prob, model_fit) in zip(petab_probs, model_fits)];
+    # Progress (one line per model start and end) goes to the main log.
+    fit_times = zeros(n_models)
+    model_fits = Vector{Any}(undef, n_models)
+    counter = Threads.Atomic{Int}(0)
+    fit_summary(fit) = "fmin $(round(fit.fmin; digits=3)), $(count(<(fit.fmin + 1e-3), fit.fmins))/$(length(fit.fmins)) starts within 1e-3 of fmin"
+    for i in model_order
+        with_model_log(i, counter, n_models; summary=fit_summary) do io
+            ldp = make_insect_ldp(models[i], data; tol=1e-6)
+            fit_times[i] = @elapsed model_fits[i] = fit_MAP(ldp, 10; rng=StableRNG(hash((genmodel_idx, i, "fit_MAP"))))
+            model_fits[i]
+        end
+    end
+    log_failures()
+    model_fits = [model_fit for model_fit in model_fits]
+    nllhs = [-model_fit.loglik for model_fit in model_fits];
     @suppress_err @save "$OUTDIR/MAP.jld2" model_fits fit_times nllhs
 end
 
-hess_times = zeros(length(petab_probs))
-shuffled_MAP_hessians = @showprogress [
-    begin
-        t0 = time_ns()
-        hess = petab_probs[i].hess(model_fits[i].xmin)
-        hess_times[i] = (time_ns() - t0)/1e9
-        hess
-    end for i in shuffle_perm
-];
-MAP_hessians = shuffled_MAP_hessians[invperm(shuffle_perm)]; # unshuffle
+hess_times = zeros(n_models)
+MAP_hessians = Vector{Matrix{Float64}}(undef, n_models)
+for i in model_order
+    ldp = make_insect_ldp(models[i], data; tol=1e-6)
+    hess_times[i] = @elapsed MAP_hessians[i] = neglogpost_hessian(ldp, model_fits[i].xmin)
+end
+logmsg("Hessians done, $(round(sum(hess_times); digits=1)) s in total")
 
 @save "$OUTDIR/MAP_hess.jld2" MAP_hessians hess_times

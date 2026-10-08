@@ -1,5 +1,7 @@
 # Run setup.jl.
 include(joinpath(@__DIR__, "setup.jl"));
+include(joinpath(@__DIR__, "ldp_setup.jl"));
+include(joinpath(@__DIR__, "nuts_helpers.jl"));
 
 # This script takes one command-line argument, which is the index of `feasible_idxs`.
 # dir_idx = 2
@@ -10,9 +12,9 @@ OUTDIR = mkpath(joinpath(@__DIR__, "output", "data$(dir_idx)")) # output directo
 mkpath(OUTDIR)
 
 # Fetch packages.
-using PEtab, OrdinaryDiffEq
+using OrdinaryDiffEq
 using JLD2, ProgressMeter, Random, PDMats, StableRNGs, Suppressor
-using AdvancedHMC, Bijectors, LinearAlgebra, LogDensityProblems, LogDensityProblemsAD, MCMCChains, Turing
+using AdvancedHMC, LinearAlgebra, LogDensityProblems, MCMCChains
 
 using ThreadPinning
 isslurmjob() = get(ENV, "SLURM_JOBID", "") != ""
@@ -27,50 +29,37 @@ data = all_data[genmodel_idx];
 
 function main(model_idx)  
     nadapts = 1000
-    n_sample = 7000
+    n_sample = 8000
     n_chains = 5
 
     # nadapts = 50
     # n_sample = 50
     # n_chains = 2
 
-    mcmc_fname = joinpath(OUTDIR, "chains$(n_sample)_model$(model_idx).jld2")
+    mcmc_fname = joinpath(OUTDIR, "chains_8k_model$(model_idx).jld2")
     # isfile(mcmc_fname) && return false
 
-    pmodel = create_petab_model(models[model_idx], data, u0)
-    petab_prob = PEtabODEProblem(pmodel; odesolver=ODESolver(Rodas5P(), verbose=false))
-    target = PEtabLogDensity(petab_prob);
+    target = make_insect_ldp(models[model_idx], data; tol=1e-6)
     MAP = model_fits[model_idx].xmin
     hess = MAP_hessians[model_idx]
     Σ = inv(PDMat(hermitianpart!(hess)))
 
-    seed = model_idx
-    rng = StableRNG(seed + 2026)
+    seed = hash((genmodel_idx, model_idx, "MCMC_chains"))
+    rng = StableRNG(seed)
 
     init_params = [
         begin
             p = copy(collect(MAP))
             while true
-                tdist_sim = rand(rng, MvTDist(4, MAP, Σ))
-                p = to_prior_scale(tdist_sim, target) |> target.inference_info.bijectors
-                isfinite(target.logtarget(p)) && break
+                p = rand(rng, MvTDist(4, MAP, Σ))
+                isfinite(LogDensityProblems.logdensity(target, p)) && break
             end            
-            InitFromParams((θ=p,))
+            p
         end for _ in 1:n_chains
     ]
-    
-    @model function turing_model(target)
-        θ ~ filldist(Turing.Flat(), target.dim)
-        Turing.@addlogprob! target.logtarget(θ)
-        return nothing
-    end
 
-    # Eun MCMC chain...        
-    chn = sample(
-        rng, turing_model(target), Turing.NUTS(0.9, metricT=AdvancedHMC.UnitEuclideanMetric), MCMCThreads(), n_sample, n_chains; 
-        initial_params=init_params, 
-        nadapts=nadapts, save_state=false, progress=false
-    );
+    # Run MCMC chains...
+    chn = run_nuts_chains(rng, target, init_params, n_sample, nadapts; δ=0.9);
     acc_rates = collect(vec(mean(chn[:acceptance_rate]; dims=1)))
     step_sizes = collect(vec(chn[:step_size][end,:]))
     ess_df = ess(chn)
@@ -106,7 +95,7 @@ exit()
 
 model_idx = 50
 D = length(parameters(models[model_idx]))
-mcmc_fname = joinpath(OUTDIR, "chains_model$(model_idx).jld2")
+mcmc_fname = joinpath(OUTDIR, "chains_8k_model$(model_idx).jld2")
 @load mcmc_fname chn ess_df;
 ess_df
 

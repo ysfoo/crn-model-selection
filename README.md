@@ -12,7 +12,7 @@ This repository hosts the code for reproducing the results of the manuscript "Re
  - robust adaptive multiple importance sampling (robust AMIS), and
  - bridge sampling.
 
-**N.B.** This code repository is not compatible with versions of [PEtab.jl](https://github.com/sebapersson/PEtab.jl) beyond v3.11.3, due to breaking changes in [how PEtab.jl v4 handles parameter transformations](https://github.com/sebapersson/PEtab.jl/blob/main/HISTORY.md). This compatibility requirement is reflected in the `Project.toml` of this repository.
+<!-- **N.B.** This code repository is not compatible with versions of [PEtab.jl](https://github.com/sebapersson/PEtab.jl) beyond v3.11.3, due to breaking changes in [how PEtab.jl v4 handles parameter transformations](https://github.com/sebapersson/PEtab.jl/blob/main/HISTORY.md). This compatibility requirement is reflected in the `Project.toml` of this repository. -->
 
 ## Coral re-growth example
 
