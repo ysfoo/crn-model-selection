@@ -257,7 +257,7 @@ function compute_QB_info(
     particles, target, npass, prev_pop_info=nothing; acc_target=0.8, jitter=0.2, max_dlog=Inf, use_ngrad=false,
     min_obs=20, refit_each_pass=false,
 )
-    stepsize = qb_stepsize(particles, npass; acc_target, max_dlog, use_ngrad, min_obs)
+    stepsize = qb_stepsize(particles, npass, prev_pop_info; acc_target, max_dlog, use_ngrad, min_obs)
     invmass = (isnothing(prev_pop_info) || refit_each_pass) ? compute_invmass(particles, target, npass).invmass :
         prev_pop_info.invmass
     return (invmass = invmass, stepsize = stepsize, jitter = jitter)

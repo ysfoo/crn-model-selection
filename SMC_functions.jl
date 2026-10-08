@@ -209,11 +209,19 @@ function fit_acc_stepsize(stepsizes, accs; acc_target=0.8, weights=nothing, min_
 end
 
 # Step size for the next round: quasi-binomial fit of acceptance on log step size (target `acc_target`) in pass 1; in later
-# passes of the same SMC iteration the previous geometric mean times 0.95, capped at the fit, so it never increases.
-function qb_stepsize(particles, npass; acc_target=0.8, max_dlog=Inf, use_ngrad=false, min_obs=20)
+# passes of the same SMC iteration the previous pass's base step size (`prev_pop_info.stepsize`, before jitter) times
+# 0.95, capped at the fit, so it never increases. Without `prev_pop_info` (pass 1), the nominal step size, used when the
+# fit fails, is the geometric mean of the particles' (jittered) step sizes.
+function qb_stepsize(
+    particles, npass, prev_pop_info=nothing; acc_target=0.8, max_dlog=Inf, use_ngrad=false, min_obs=20,
+)
     stepsizes = [p.stepsize for p in particles]
-    valid = filter(s -> isfinite(s) && s > 0, stepsizes)
-    stepsize = exp(mean(log.(valid))) # nominal stepsize is previous stepsize
+    if isnothing(prev_pop_info)
+        valid = filter(s -> isfinite(s) && s > 0, stepsizes)
+        stepsize = exp(mean(log.(valid))) # nominal stepsize is previous stepsize
+    else
+        stepsize = prev_pop_info.stepsize  # base step size of the previous pass
+    end
 
     accs = [hasproperty(p.info, :curr_acc_rate) ? p.info.curr_acc_rate : NaN for p in particles]
     weights = use_ngrad ? [hasproperty(p.info, :curr_n_grad) ? p.info.curr_n_grad : NaN for p in particles] : nothing
@@ -242,7 +250,7 @@ function compute_TQB_info(
     particles, target, npass, prev_pop_info=nothing; acc_target=0.8, jitter=0.2, max_dlog=Inf, use_ngrad=false,
     min_obs=20, λN=DEFAULT_λN, ζ_min=0.2, refit_each_pass=false, verbose=1,
 )
-    stepsize = qb_stepsize(particles, npass; acc_target, max_dlog, use_ngrad, min_obs)
+    stepsize = qb_stepsize(particles, npass, prev_pop_info; acc_target, max_dlog, use_ngrad, min_obs)
     maps = (isnothing(prev_pop_info) || refit_each_pass) ? fit_maps(particles, target, npass; λN, ζ_min, verbose) :
         prev_pop_info.maps
     if verbose > 0
