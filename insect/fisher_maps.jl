@@ -127,16 +127,19 @@ end
 # ---------------------------------------------------------------------------------------------------------------------
 # Guards for use in a sampler
 #
-# A fit is only constrained where there are particles. With one side (nearly) empty, the slope on that side is arbitrary
-# and can come out as 1e-224 or 4e7. Such a map is still a bijection in exact arithmetic, but in floating point it
-# truncates the support (F almost constant beyond θ*, so θ cannot move past θ* and log F' adds a wall of hundreds of
-# nats) or makes the latent curvature F'^2 h enormous there. Either breaks the kernel. Fall back to the identity (the
-# u-space mass matrix then reproduces the affine nutpie map) unless
+# A fit is only constrained where there are particles. With one side (nearly) empty, the slope on that side is
+# unidentified and can come out as 1e-224 or 4e7 (for δ_A on data 4 SMC505_4k iteration 26, with 9 spike particles, all
+# particles sit at u > 35, so F'(u) ≈ s_high + s_low e^{-u/ζ} on the population and s_low trades off against θ*; D is flat
+# for s_low ≥ 1000). Such a map is fine on the population but extreme beyond it: F' grows towards s_low, so the latent
+# curvature F'^2 h explodes in the tail, or F is nearly constant and truncates the support in floating point.
+# Fall back to the equal-slope optimum (the affine nutpie map, s^2 = sqrt(Var θ / Var α), which minimises D over
+# s_low = s_high) unless
 #   - both parts (split at `thres` for spike-and-slab coordinates) have at least n_min particles,
 #   - at least n_min particles lie on each side of θ*,
 #   - s_high / s_low is within [1/max_ratio, max_ratio], and ζ is finite.
-const IDENTITY_MAP = TwoSlope(0.0, 1.0, 1.0, 1.0)   # F(u) = u
-function guard_map(f, θ; n_min=50, max_ratio=1e4)
+# NUTS then runs in u with an identity mass matrix: the D-optimal map already sets the scale of each coordinate.
+equal_slope_map(θ, α) = (s = nutpie_scale(θ, α); TwoSlope(median(θ), s, s, 1.0))   # F(u) = median + s u
+function guard_map(f, θ, α; n_min=50, max_ratio=1e4)
     m = f.m
     reason = if min(f.n_lo, f.n_hi) < n_min
         "part with < $(n_min) particles"
@@ -147,7 +150,7 @@ function guard_map(f, θ; n_min=50, max_ratio=1e4)
     else
         ""
     end
-    return isempty(reason) ? (m, "") : (IDENTITY_MAP, reason)
+    return isempty(reason) ? (m, "") : (equal_slope_map(θ, α), reason)
 end
 
 # Target in u-space: log π(F(u)) + Σ_k log F_k'(u_k). Exact change of variables for any fixed set of bijective maps.

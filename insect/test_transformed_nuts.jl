@@ -7,10 +7,10 @@
 #
 # The population of iteration i (equal weights, targeting π_(γ_i)) is moved at its own γ_i by two methods:
 #   affine:      NUTS on θ with the nutpie diagonal mass matrix of the population (the current sampler);
-#   transformed: NUTS on u, θ_k = F_k(u_k), with two-slope maps fitted to the population for the spike-and-slab
-#                coordinates (identity for the others, and for any map that fails `guard_map`), and the nutpie mass
-#                matrix estimated in u-space.
-# Maps and mass matrices come from the whole (trimmed) population; the moves are run on a random subset of n_sub
+#   transformed: NUTS on u, θ_k = F_k(u_k), with an identity mass matrix. Spike-and-slab coordinates get the two-slope
+#                map fitted to the population, or the equal-slope optimum (the affine nutpie map) if the fit fails
+#                `guard_map`; the other coordinates get the equal-slope optimum.
+# Maps and the affine mass matrix come from the whole (trimmed) population; the moves are run on a random subset of n_sub
 # particles. Each method gets two rounds of 5 NUTS transitions (`repeat_5`): round A, then round B with the step size
 # from the quasi-binomial fit to round A's acceptance (as `compute_QB_info` does in pass 1). The affine round A uses the
 # stored particles' step sizes and acceptance rates, as the sampler would; the transformed round A has no history, so it
@@ -63,11 +63,11 @@ max_diff = maximum(abs.(logp .- [p.logtarget for p in particles]))
 max_diff < 1e-6 || error("Recomputed log target differs from the stored one (max $(max_diff)): wrong path or γ?")
 keep = logp .>= quantile(logp, 0.01)
 
-maps = fill(IDENTITY_MAP, n_dim)
+maps = [equal_slope_map(X[k, keep], G[k, keep]) for k in 1:n_dim]
 map_rows = Vector{Vector{Any}}()
 for k in ss_idxs
     f = fit_twoslope(k, X[k, keep], G[k, keep])
-    m, reason = guard_map(f, X[k, keep])
+    m, reason = guard_map(f, X[k, keep], G[k, keep])
     maps[k] = m
     @info "map $(COORD_NAMES[k])" f.m f.D f.D_affine used_twoslope = isempty(reason) reason
     push!(map_rows, Any[k, COORD_NAMES[k], f.m.θs, f.m.slo, f.m.shi, f.m.ζ, f.D, f.D_affine, isempty(reason), reason])
@@ -81,11 +81,11 @@ ttarget = TransformedTarget(target, maps)
 mkparticles(states) = [SMCParticle(s, NaN, NaN, NaN, 0, NamedTuple()) for s in states]
 U = reduce(hcat, [to_latent(maps, X[:, j]) for j in axes(X, 2)])
 @info "inverse map accuracy" max_err = maximum(abs.(reduce(hcat, [to_theta(maps, U[:, j]) for j in axes(U, 2)]) .- X))
-t_inv = @elapsed begin
-    invmass_aff = compute_invmass(particles, target, 1).invmass
-    invmass_tr = compute_invmass(mkparticles([U[:, j] for j in axes(U, 2)]), ttarget, 1).invmass
-end
-@info "mass matrices" t_inv invmass_aff invmass_tr
+invmass_aff = compute_invmass(particles, target, 1).invmass
+# the transformed move uses M = I; the u-space nutpie diagonal is only logged, to check that the maps set the scale
+invmass_tr = ones(n_dim)
+nutpie_u = compute_invmass(mkparticles([U[:, j] for j in axes(U, 2)]), ttarget, 1).invmass
+@info "u-space nutpie diagonal (not used)" nutpie_u = round.(nutpie_u, sigdigits=3)
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Moves
