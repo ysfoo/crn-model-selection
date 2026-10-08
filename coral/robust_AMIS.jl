@@ -4,18 +4,18 @@ include(joinpath(@__DIR__, "../AMIS_helpers.jl"));
 # This script takes one command-line argument, which is the seed.
 seed = parse(Int64, ARGS[1])
 
-using PDMats, LogExpFunctions, PSIS
+using PDMats, LogExpFunctions, PSIS, StableRNGs
 
 @load joinpath(@__DIR__, "output/MAPs.jld2") model_fits;
 
 mkpath(INFDIR)
 INFDIR = joinpath(@__DIR__, "output/seed$(seed)");
 
-function robust_AMIS(target, prior_sampler, prior_means, prior_vars; 
+function robust_AMIS(rng, target, prior_sampler, prior_means, prior_vars; 
                     nruns=20, Kmax=50)
 
     d = LogDensityProblems.dimension(target)
-    @time q1_dists, em_init_dists = init_dists(target, prior_sampler, prior_means, prior_vars, nruns, Kmax, 2d)
+    @time q1_dists, em_init_dists = init_dists(target, prior_sampler, prior_means, prior_vars, nruns, Kmax, 2d; rng=rng)
     K1 = length(q1_dists)
     
     n_vec = [0; round.(Int, logrange(1e4, 1e6, 16))]
@@ -39,7 +39,7 @@ function robust_AMIS(target, prior_sampler, prior_means, prior_vars;
 
         # Draw and evaluate new samples
         gm = gm_vec[end]
-        new_samples = rand(gm, n_incr)
+        new_samples = rand(rng, gm, n_incr)
         all_samples = hcat(all_samples, new_samples)
 
         new_logps = LogDensityProblems.logdensity.(Ref(target), eachcol(new_samples))
@@ -78,7 +78,7 @@ function robust_AMIS(target, prior_sampler, prior_means, prior_vars;
 
         # Re-init mixture
         K_add = max(Kmax - gm.K, 0)
-        sample_idxs = sample(1:n_em, weights(em_ws), K_add; replace=false)
+        sample_idxs = sample(rng, 1:n_em, weights(em_ws), K_add; replace=false)
         overall_var = var(X; dims=2) |> vec
         new_prec_chol = cholesky(diagm(1 ./ overall_var))
         if iter == 1
@@ -159,7 +159,7 @@ function robust_AMIS(target, prior_sampler, prior_means, prior_vars;
     n_incr = incr_vec[end]
     prop_ws = incr_vec ./ n_tot;
     gm = gm_vec[end];
-    new_samples = rand(gm, n_incr);
+    new_samples = rand(rng, gm, n_incr);
     all_samples = hcat(all_samples, new_samples);
 
     new_logps = LogDensityProblems.logdensity.(Ref(target), eachcol(new_samples))
@@ -194,8 +194,8 @@ for model_sym in model_syms
     prior_vars = getproperty.(prior_dists, :σ) .|> abs2
 
     model_fit = model_fits[model_sym].value
-    Random.seed!(seed + (model_sym |> String |> hash))
-    timed_res = @timed robust_AMIS(target, prior_sampler, prior_means, prior_vars; nruns=30)
+    rng = StableRNG(hash((seed, model_sym, "robust_AMIS")))
+    timed_res = @timed robust_AMIS(rng, target, prior_sampler, prior_means, prior_vars; nruns=30)
     @save fname timed_res
 
     psis_logws = timed_res.value.psis_logws

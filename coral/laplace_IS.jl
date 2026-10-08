@@ -4,14 +4,14 @@ include(joinpath(@__DIR__, "../stats_helpers.jl"));
 # This script takes one command-line argument, which is the seed.
 seed = parse(Int64, ARGS[1])
 
-using PDMats, LogExpFunctions, PSIS, ProgressMeter
+using PDMats, LogExpFunctions, PSIS, ProgressMeter, StableRNGs
 
 @load joinpath(@__DIR__, "output/MAPs.jld2") model_fits;
 
-function laplace_IS(target, MAP, hess, n_samples; df=4)
+function laplace_IS(rng, target, MAP, hess, n_samples; df=4)
     Σ = inv(PDMat(hermitianpart!(hess)))
     proposal = MvTDist(df, MAP, Σ)
-    samples = rand(proposal, n_samples)
+    samples = rand(rng, proposal, n_samples)
 
     logps = LogDensityProblems.logdensity.(Ref(target), eachcol(samples))
     logps[findall(isnan, logps)] .= -Inf
@@ -39,8 +39,8 @@ begin
         target = target_dict[model_sym]
 
         model_fit = model_fits[model_sym].value
-        Random.seed!(seed + (model_sym |> String |> hash))
-        timed_res = @timed laplace_IS(target, model_fit.MAP, model_fit.hess, n_samples)
+        rng = StableRNG(hash((seed, model_sym, "laplace_IS")))
+        timed_res = @timed laplace_IS(rng, target, model_fit.MAP, model_fit.hess, n_samples)
         @save fname timed_res
 
         Zhat = logsumexp(timed_res.value.psis_logws) - log(n_samples)

@@ -4,14 +4,14 @@ include(joinpath(@__DIR__, "../gaussian_mixtures.jl"));
 # This script takes one command-line argument, which is the seed.
 seed = parse(Int64, ARGS[1])
 
-using PDMats, LogExpFunctions, PSIS
+using PDMats, LogExpFunctions, PSIS, StableRNGs
 
 @load joinpath(@__DIR__, "output/MAPs.jld2") model_fits;
 
 INFDIR = joinpath(@__DIR__, "output/seed$(seed)");
 mkpath(INFDIR)
 
-function orig_AMIS(target, MAP, hess; Kmax=50, df=4)
+function orig_AMIS(rng, target, MAP, hess; Kmax=50, df=4)
     d = LogDensityProblems.dimension(target)
     Σ = inv(PDMat(hermitianpart!(hess)))
     q_init = MvTDist(df, MAP, Σ)
@@ -38,9 +38,9 @@ function orig_AMIS(target, MAP, hess; Kmax=50, df=4)
         # Draw and evaluate new samples
         gm = gm_vec[end]
         if iter == 1
-            new_samples = rand(q_init, n_incr)
+            new_samples = rand(rng, q_init, n_incr)
         else
-            new_samples = rand(gm, n_incr)
+            new_samples = rand(rng, gm, n_incr)
         end
         all_samples = hcat(all_samples, new_samples)
 
@@ -77,7 +77,7 @@ function orig_AMIS(target, MAP, hess; Kmax=50, df=4)
         
         # Re-init mixture
         K_add = Kmax - gm.K
-        sample_idxs = sample(1:n_em, weights(em_ws), K_add; replace=false)
+        sample_idxs = sample(rng, 1:n_em, weights(em_ws), K_add; replace=false)
         overall_var = var(X; dims=2) |> vec
         new_prec_chol = cholesky(diagm(1 ./ overall_var))
         gm = K_add == 0 ? deepcopy(gm) : GaussianMixture(
@@ -123,7 +123,7 @@ function orig_AMIS(target, MAP, hess; Kmax=50, df=4)
     n_incr = incr_vec[end]
     prop_ws = incr_vec ./ n_tot;
     gm = gm_vec[end];
-    new_samples = rand(gm, n_incr);
+    new_samples = rand(rng, gm, n_incr);
     all_samples = hcat(all_samples, new_samples);
 
     new_logps = LogDensityProblems.logdensity.(Ref(target), eachcol(new_samples))
@@ -156,8 +156,8 @@ for model_sym in model_syms
     target = target_dict[model_sym]
 
     model_fit = model_fits[model_sym].value
-    Random.seed!(seed + (model_sym |> String |> hash))
-    timed_res = @timed orig_AMIS(target, model_fit.MAP, model_fit.hess)
+    rng = StableRNG(hash((seed, model_sym, "orig_AMIS")))
+    timed_res = @timed orig_AMIS(rng, target, model_fit.MAP, model_fit.hess)
     @save fname timed_res
 
     psis_logws = timed_res.value.psis_logws

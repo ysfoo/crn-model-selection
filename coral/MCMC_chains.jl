@@ -19,7 +19,7 @@ function run_mcmc(model_sym, nadapts, n_sample, n_chains)
     mcmc_fname = joinpath(INFDIR, "chains_$(model_sym).jld2")
     target = target_dict[model_sym]
 
-    rng = StableRNG(seed + (model_sym |> String |> hash))
+    rng = StableRNG(hash((seed, model_sym, "MCMC_chains")))
     chn = sample(
         rng, turing_model(target), Turing.NUTS(0.9, metricT=AdvancedHMC.UnitEuclideanMetric), 
         MCMCThreads(), n_sample, n_chains; nadapts, progress=false
