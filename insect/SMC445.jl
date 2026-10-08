@@ -4,7 +4,7 @@ using StatsFuns
 # SMC345 (the 3xx path, moment-interpolated spike-and-slab mixture, with the :distributed backend) with NUTS on the
 # two-slope transformed target: maps fitted to the population before every round (`compute_TQB_info`), identity mass
 # matrix, same step-size rule (`nuts_transformed_move`).
-# Usage: julia --project=.. SMC445.jl <data idx> [1k|2k|4k]   (population size, default 4k)
+# Usage: julia --project=.. SMC445.jl <data idx> [1k|2k|4k|8k]   (population size, default 4k)
 run_str = "SMC445"
 σ0 = sqrt(68);
 unimodal_prior = Normal(μ0, σ0);
@@ -33,7 +33,7 @@ end
 init_sampler = (rng) -> rand.(Ref(rng), init_dists);
 
 psize_str = length(ARGS) >= 2 ? ARGS[2] : "4k"
-pop_size = Dict("1k" => 1000, "2k" => 2000, "4k" => 4000)[psize_str]; target_ess = 0.8pop_size; init_pop_size = pop_size;
+pop_size = Dict("1k" => 1000, "2k" => 2000, "4k" => 4000, "8k" => 8000)[psize_str]; target_ess = 0.8pop_size; init_pop_size = pop_size;
 
 fname = joinpath(@__DIR__, "output/data$(dir_idx)/$(run_str)_$(psize_str).jld2");
 display(fname)
