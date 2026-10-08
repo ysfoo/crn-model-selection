@@ -37,11 +37,11 @@ rng = StableRNG(hash((dir_idx, run_str, pop_size)))
 run_SMC(
     pop_size, target_ess, init_sampler, prior_path, ldp_builder, move_func, n_nuts_func, fname;
     init_stepsize=init_stepsize, init_pop_size=init_pop_size, max_npass=10, compute_pop_info=compute_QB_info,
-    verbose=1, rng=rng, parallel=true, pbar_lines=20,
+    verbose=1, rng=rng, parallel=:threads, pbar_lines=20,
 );
 
 # resume_SMC(
 #     pop_size, target_ess, prior_path, ldp_builder, move_func, n_nuts_func, fname;
 #     max_npass=10, compute_pop_info=compute_QB_info,
-#     verbose=1, rng=rng, parallel=true, pbar_lines=20,
+#     verbose=1, rng=rng, parallel=:threads, pbar_lines=20,
 # );

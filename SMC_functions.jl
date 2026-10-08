@@ -167,16 +167,15 @@ adapt_using_curr(info) = 1.5^((info.curr_acc_rate-0.8)/0.2)
 #                  shared counter (so slow particles do not hold up a fixed block of others);
 #   :distributed - Distributed.jl worker processes (see `start_SMC_workers`). Each remote call rebuilds the target from
 #                  `(ldp_builder, prior_path, γ)` on the worker and processes a batch of particles. Every process has its
-#                  own heap, so a garbage collection on one worker does not stop the others;
-#   true / false - :distributed if worker processes exist, else :threads; false is :serial.
+#                  own heap, so a garbage collection on one worker does not stop the others.
 # Each particle is moved with its own RNG, StableRNG(seed), with the seeds drawn from the master RNG before each round,
 # so results do not depend on the backend, on the number of threads or workers, or on which particle finishes first.
 
 function resolve_backend(parallel)
-    parallel === false && return :serial
-    parallel === true && return nprocs() > 1 ? :distributed : :threads
+    parallel isa Bool && throw(ArgumentError(
+        "parallel = $parallel is no longer accepted; use :serial, :threads or :distributed"))
     parallel in (:serial, :threads, :distributed) ||
-        throw(ArgumentError("parallel must be true, false, :serial, :threads or :distributed (got $(repr(parallel)))"))
+        throw(ArgumentError("parallel must be :serial, :threads or :distributed (got $(repr(parallel)))"))
     parallel === :distributed && nprocs() == 1 &&
         throw(ArgumentError("parallel = :distributed, but there are no worker processes (see start_SMC_workers)"))
     return parallel
@@ -348,7 +347,7 @@ end
 # (stored density of the previous target), so a single such particle can receive a huge weight and collapse the
 # resampled population onto one ancestor. `γ` is the path parameter of the population's own target.
 # Particles whose density is not finite when re-evaluated get log target and log likelihood -Inf (zero weight).
-function refresh_logtargets(particles, ldp_builder, prior_path, γ; parallel=false)
+function refresh_logtargets(particles, ldp_builder, prior_path, γ; parallel=:serial)
     target = ldp_builder(prior_path, γ)
     logtargets = particle_map(
         _logdensity_at, nothing, [p.state for p in particles], target, (ldp_builder, prior_path, γ),
@@ -372,7 +371,7 @@ function SMC_iteration!(
     all_particles, targetinfos, npass_vec, figs, smc_times,
     prior_path, ldp_builder, move_func, n_nuts_func, compute_pop_info, fname, rng; 
     max_npass=10, refresh_logtarget=true,
-    parallel=false, pbar_lines=pop_size, vid_path=nothing, make_fig=nothing, verbose=0
+    parallel=:serial, pbar_lines=pop_size, vid_path=nothing, make_fig=nothing, verbose=0
 )
     t_start = time()
 
@@ -517,13 +516,13 @@ function log_backend(backend)
     flush(stderr)
 end
 
-# `parallel` selects the backend (see `resolve_backend`); `max_iter` stops after that many SMC iterations (for tests).
+# `parallel` selects the backend, :serial, :threads or :distributed (see "Parallel backends"); `max_iter` stops after that many SMC iterations (for tests).
 function run_SMC(
     pop_size, target_ess, init_sampler, prior_path, ldp_builder, move_func, n_nuts_func, fname;
     init_pop_size=pop_size, init_stepsize::Float64=0.01, 
     max_npass=10, refresh_logtarget=true, compute_pop_info=(particles, target, npass)->(;),
     verbose=0, vid_path=nothing, make_fig=nothing,
-    parallel=false, pbar_lines=pop_size, rng=Random.default_rng(), max_iter=typemax(Int),
+    parallel=:serial, pbar_lines=pop_size, rng=Random.default_rng(), max_iter=typemax(Int),
 )
     myid() == 1 || return nothing  # workers only serve the master (see `start_SMC_workers`)
     parallel = resolve_backend(parallel)
@@ -585,7 +584,7 @@ function resume_SMC(
     pop_size, target_ess, prior_path, ldp_builder, move_func, n_nuts_func, fname;
     max_npass=10, refresh_logtarget=true, compute_pop_info=(particles, target, npass)->(;),
     verbose=0, vid_path=nothing, make_fig=nothing,
-    parallel=false, pbar_lines=pop_size, rng=Random.default_rng(), max_iter=typemax(Int),
+    parallel=:serial, pbar_lines=pop_size, rng=Random.default_rng(), max_iter=typemax(Int),
 )
     myid() == 1 || return nothing  # workers only serve the master (see `start_SMC_workers`)
     parallel = resolve_backend(parallel)
