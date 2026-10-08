@@ -3,6 +3,11 @@ include(joinpath(@__DIR__, "setup.jl"));
 include(joinpath(@__DIR__, "ldp_setup.jl"));
 include(joinpath(@__DIR__, "nuts_helpers.jl"));
 
+# With MCMC_NWORKERS set, chains run on that many single-thread worker processes; otherwise one chain per thread.
+start_nuts_workers(joinpath.(@__DIR__, ["setup.jl", "ldp_setup.jl", "nuts_helpers.jl"]))
+parallel = nprocs() > 1 ? :distributed : :threads
+@info "MCMC chains run with parallel = $(repr(parallel)) ($(nworkers()) workers, $(Threads.nthreads()) threads)"
+
 # This script takes one command-line argument, which is the index of `feasible_idxs`.
 # dir_idx = 2
 dir_idx = parse(Int64, ARGS[1])
@@ -18,7 +23,7 @@ using AdvancedHMC, LinearAlgebra, LogDensityProblems, MCMCChains
 
 using ThreadPinning
 isslurmjob() = get(ENV, "SLURM_JOBID", "") != ""
-isslurmjob() ? pinthreads(:affinitymask) : pinthreads(:cores);
+parallel === :threads && (isslurmjob() ? pinthreads(:affinitymask) : pinthreads(:cores));
 
 # Load ground truth, data, MAP results.
 @load joinpath(@__DIR__, "data.jld2") all_data;
@@ -59,7 +64,7 @@ function main(model_idx)
     ]
 
     # Run MCMC chains...
-    chn = run_nuts_chains(rng, target, init_params, n_sample, nadapts; δ=0.9);
+    chn = run_nuts_chains(rng, target, init_params, n_sample, nadapts; δ=0.9, parallel=parallel);
     acc_rates = collect(vec(mean(chn[:acceptance_rate]; dims=1)))
     step_sizes = collect(vec(chn[:step_size][end,:]))
     ess_df = ess(chn)
