@@ -250,65 +250,15 @@ function compute_FT_info(
 end
 
 
-## Population info for `nuts_invmass_move` with a regression-based step size.
-# Regress acceptance rates from previous population against log step size. Fit model for E[a | log ε] using quasi-binomial
-# regression a(ε) = logistic(β0 + β1 (log ε - mean log ε)) by Fisher scoring. Returns the step size solution to a(ε)=`acc_target`.
-# `nuts_invmass_move` multiplies this stepsize by exp(jitter * randn()).
-# - `weights`: if `use_ngrad`, particles are weighted by `info.curr_n_grad`, default off.
-# - `max_dlog`: cap on |log new ε - mean log ε| (default: no cap), to limit extrapolation beyond the spread of the step sizes.
-# - Fallback (no acceptance information, too few particles, no spread in step sizes, or a non-negative slope): the
-#   geometric mean of the particles' step sizes is used, i.e. the step size is left unchanged.
-function fit_acc_stepsize(stepsizes, accs; acc_target=0.8, weights=nothing, min_obs=20, max_dlog=Inf)
-    ok = findall(eachindex(stepsizes)) do i
-        isfinite(stepsizes[i]) && stepsizes[i] > 0 && isfinite(accs[i]) &&
-            (isnothing(weights) || (isfinite(weights[i]) && weights[i] > 0))
-    end
-    length(ok) < min_obs && return nothing
-    x = log.(stepsizes[ok]); y = clamp.(accs[ok], 0., 1.)
-    w = isnothing(weights) ? ones(length(ok)) : Float64.(weights[ok])
-    x̄ = sum(w .* x) / sum(w); xc = x .- x̄
-    maximum(abs, xc) > 1e-8 || return nothing
-
-    β = [logit(clamp(sum(w .* y) / sum(w), 0.01, 0.99)), 0.]
-    # Fisher scoring
-    for _ in 1:100
-        η = β[1] .+ β[2] .* xc; μ = logistic.(η)
-        v = max.(μ .* (1 .- μ), 1e-6)
-        z = η .+ (y .- μ) ./ v                  # working response
-        W = w .* v
-        S = [sum(W) sum(W .* xc); sum(W .* xc) sum(W .* xc .^ 2)]
-        β_new = S \ [sum(W .* z), sum(W .* xc .* z)]
-        all(isfinite, β_new) || return nothing
-        converged = maximum(abs, β_new .- β) < 1e-8
-        β = β_new
-        converged && break
-    end
-    β[2] < 0 || return nothing
-    dlog = clamp((logit(acc_target) - β[1]) / β[2], -max_dlog, max_dlog)
-    return (stepsize = exp(x̄ + dlog), slope = β[2], centre = exp(x̄))
-end
-
+# The mass matrix is estimated from the population before the first round of an SMC iteration and reused from
+# `prev_pop_info` in its later rounds; the step size is updated every round. `refit_each_pass=true` re-estimates the mass
+# matrix before every round, as runs before this option did.
 function compute_QB_info(
     particles, target, npass, prev_pop_info=nothing; acc_target=0.8, jitter=0.2, max_dlog=Inf, use_ngrad=false,
-    min_obs=20,
+    min_obs=20, refit_each_pass=false,
 )
-    stepsizes = [p.stepsize for p in particles]
-    valid = filter(s -> isfinite(s) && s > 0, stepsizes)
-    stepsize = exp(mean(log.(valid))) # nominal stepsize is previous stepsize
-
-    accs = [hasproperty(p.info, :curr_acc_rate) ? p.info.curr_acc_rate : NaN for p in particles]
-    weights = use_ngrad ? [hasproperty(p.info, :curr_n_grad) ? p.info.curr_n_grad : NaN for p in particles] : nothing
-    fit = fit_acc_stepsize(stepsizes, accs; acc_target, weights, min_obs, max_dlog)
-    if npass > 1
-        stepsize *= 0.95 # decrease if multiple NUTS rounds
-        if !isnothing(fit)
-            stepsize = min(stepsize, fit.stepsize) # don't increase stepsize
-        end
-    elseif !isnothing(fit)
-        stepsize = fit.stepsize
-    end
-    return merge(
-        compute_invmass(particles, target, npass),
-        (stepsize = stepsize, jitter = jitter),
-    )
+    stepsize = qb_stepsize(particles, npass; acc_target, max_dlog, use_ngrad, min_obs)
+    invmass = (isnothing(prev_pop_info) || refit_each_pass) ? compute_invmass(particles, target, npass).invmass :
+        prev_pop_info.invmass
+    return (invmass = invmass, stepsize = stepsize, jitter = jitter)
 end

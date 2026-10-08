@@ -309,65 +309,6 @@ function compute_FT_info(
 end
 
 
-## Population info for `nuts_invmass_move` with a regression-based step size.
-# Regress acceptance rates from previous population against log step size. Fit model for E[a | log ε] using quasi-binomial
-# regression a(ε) = logistic(β0 + β1 (log ε - mean log ε)) by Fisher scoring. Returns the step size solution to a(ε)=`acc_target`.
-# `nuts_invmass_move` multiplies this stepsize by exp(jitter * randn()).
-# - `weights`: if `use_ngrad`, particles are weighted by `info.curr_n_grad`, default on.
-# - `max_dlog`: cap on |log new ε - mean log ε| (default: no cap), to limit extrapolation beyond the spread of the step sizes.
-# - Fallback (no acceptance information, too few particles, no spread in step sizes, or a non-negative slope): the
-#   geometric mean of the particles' step sizes is used, i.e. the step size is left unchanged.
-function fit_acc_stepsize(stepsizes, accs; acc_target=0.8, weights=nothing, min_obs=20, max_dlog=Inf)
-    ok = findall(eachindex(stepsizes)) do i
-        isfinite(stepsizes[i]) && stepsizes[i] > 0 && isfinite(accs[i]) &&
-            (isnothing(weights) || (isfinite(weights[i]) && weights[i] > 0))
-    end
-    length(ok) < min_obs && return nothing
-    x = log.(stepsizes[ok]); y = clamp.(accs[ok], 0., 1.)
-    w = isnothing(weights) ? ones(length(ok)) : Float64.(weights[ok])
-    x̄ = sum(w .* x) / sum(w); xc = x .- x̄
-    maximum(abs, xc) > 1e-8 || return nothing
-
-    β = [logit(clamp(sum(w .* y) / sum(w), 0.01, 0.99)), 0.]
-    # Fisher scoring
-    for _ in 1:100
-        η = β[1] .+ β[2] .* xc; μ = logistic.(η)
-        v = max.(μ .* (1 .- μ), 1e-6)
-        z = η .+ (y .- μ) ./ v                  # working response
-        W = w .* v
-        S = [sum(W) sum(W .* xc); sum(W .* xc) sum(W .* xc .^ 2)]
-        β_new = S \ [sum(W .* z), sum(W .* xc .* z)]
-        all(isfinite, β_new) || return nothing
-        converged = maximum(abs, β_new .- β) < 1e-8
-        β = β_new
-        converged && break
-    end
-    β[2] < 0 || return nothing
-    dlog = clamp((logit(acc_target) - β[1]) / β[2], -max_dlog, max_dlog)
-    return (stepsize = exp(x̄ + dlog), slope = β[2], centre = exp(x̄))
-end
-
-# Step size for the next round: quasi-binomial fit of acceptance on log step size (target `acc_target`) in pass 1; in later
-# passes of the same SMC iteration the previous geometric mean times 0.95, capped at the fit, so it never increases.
-function qb_stepsize(particles, npass; acc_target=0.8, max_dlog=Inf, use_ngrad=false, min_obs=20)
-    stepsizes = [p.stepsize for p in particles]
-    valid = filter(s -> isfinite(s) && s > 0, stepsizes)
-    stepsize = exp(mean(log.(valid))) # nominal stepsize is previous stepsize
-
-    accs = [hasproperty(p.info, :curr_acc_rate) ? p.info.curr_acc_rate : NaN for p in particles]
-    weights = use_ngrad ? [hasproperty(p.info, :curr_n_grad) ? p.info.curr_n_grad : NaN for p in particles] : nothing
-    fit = fit_acc_stepsize(stepsizes, accs; acc_target, weights, min_obs, max_dlog)
-    if npass > 1
-        stepsize *= 0.95 # decrease if multiple NUTS rounds
-         if !isnothing(fit)
-            stepsize = min(stepsize, fit.stepsize) # don't increase stepsize
-         end
-    elseif !isnothing(fit)
-        stepsize = fit.stepsize
-    end
-    return stepsize
-end
-
 # The mass matrix is estimated from the population before the first round of an SMC iteration and reused from
 # `prev_pop_info` in its later rounds; the step size is updated every round. `refit_each_pass=true` re-estimates the mass
 # matrix before every round, as runs before this option did.
@@ -380,60 +321,6 @@ function compute_QB_info(
         prev_pop_info.invmass
     return (invmass = invmass, stepsize = stepsize, jitter = jitter)
 end
-
-## Population info for `nuts_transformed_move`: per-coordinate two-slope maps (transform_maps.jl) and the step size
-# Before the first round of every SMC iteration, fit a two-slope map to every coordinate by minimising the sample Fisher
-# divergence with the log-slope penalty λ = λN / N (default 100 / N); the fit uses no spike-and-slab threshold. As in
-# `compute_invmass`, the 1% of particles with the lowest log target are left out of the fit. A fit whose asymptotes are
-# far from the slopes the particles see (`check_asymptotes`) falls back to the equal-slope optimum (the affine nutpie
-# map). NUTS then runs in u with the identity mass matrix, since the D-optimal maps already set the scale of each
-# coordinate. The maps are reused from `prev_pop_info` in later rounds of the same iteration (`refit_each_pass=true`
-# refits them every round). The step size follows `qb_stepsize`, updated every round; particles carry their step size
-# from the previous round, in latent units.
-function compute_TQB_info(
-    particles, target, npass, prev_pop_info=nothing; acc_target=0.8, jitter=0.2, max_dlog=Inf, use_ngrad=false,
-    min_obs=20, λN=DEFAULT_λN, ζ_min=0.2, refit_each_pass=false, verbose=1,
-)
-    stepsize = qb_stepsize(particles, npass; acc_target, max_dlog, use_ngrad, min_obs)
-    maps = (isnothing(prev_pop_info) || refit_each_pass) ? fit_maps(particles, target, npass; λN, ζ_min, verbose) :
-        prev_pop_info.maps
-    if verbose > 0
-        @info "Step size (pass $npass)" stepsize
-        flush(stdout)
-    end
-    return (invmass = ones(length(maps)), stepsize = stepsize, jitter = jitter, maps = maps)
-end
-
-# Two-slope maps for every coordinate, fitted to the population (see `compute_TQB_info`).
-function fit_maps(particles, target, npass; λN=DEFAULT_λN, ζ_min=0.2, verbose=1)
-    # scores at the current states, as in `compute_invmass`
-    logp_func = Base.Fix1(LogDensityProblems.logdensity, target)
-    x1 = particles[1].state
-    d, n = length(x1), length(particles)
-    X, G, logp = Matrix{Float64}(undef, d, n), Matrix{Float64}(undef, d, n), Vector{Float64}(undef, n)
-    result = DiffResults.GradientResult(x1)
-    for (i, p) in enumerate(particles)
-        X[:, i] .= p.state
-        result = ForwardDiff.gradient!(result, logp_func, p.state)
-        logp[i] = DiffResults.value(result)
-        G[:, i] .= DiffResults.gradient(result)
-    end
-    keep = logp .>= quantile(logp, 0.01)   # drop bottom 1% by log target density
-
-    maps = Vector{TwoSlope}(undef, d)
-    t_fit = @elapsed for k in 1:d
-        θ, α = X[k, keep], G[k, keep]
-        f = fit_twoslope(θ, α; λ=λN / length(θ), ζ_min)
-        maps[k], reason = check_asymptotes(f.m, f.u, θ, α)
-        isempty(reason) || @warn "Two-slope fit of coordinate $k replaced by the equal-slope map" reason f.m
-    end
-    if verbose > 0
-        @info "Two-slope maps fitted (pass $npass)" t_fit
-        flush(stdout)
-    end
-    return maps
-end
-
 
 ## Fisher-Rao path
 abstract type FRStrategy end
