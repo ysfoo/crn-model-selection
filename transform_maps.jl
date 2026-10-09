@@ -5,7 +5,7 @@
 # fitted to a population (θ_n, α_n = ∇ log π(θ_n)) by minimising the sample Fisher divergence of the pull-back to a
 # standard normal with a free centre, D = Var_n(F'(u_n) α_n + (log F')'(u_n) + u_n), u_n = F^{-1}(θ_n).
 
-using LogDensityProblems, LogExpFunctions, Optim, Statistics
+using ForwardDiff, LogDensityProblems, LogExpFunctions, Optim, Statistics
 
 struct TwoSlope
     θs::Float64
@@ -91,13 +91,41 @@ function split_start(θ, α, cut; ζ0=1.0)
     return (m=TwoSlope(θs, slo, shi, ζ0), n_lo, n_hi, m_lo=mlo, m_hi=mhi)
 end
 
-# Fit a two-slope map to one coordinate: one Nelder-Mead run from each of three starts (split at the 25% and 75%
-# quantiles, and the affine nutpie map), keeping the best penalised optimum. On 150 coordinate fits of stored insect
-# populations these three starts reached the best optimum found from five starts with two restarts each to within a
-# relative 6e-8, while the earlier scheme (split at the spike-and-slab threshold and affine, each with two restarts) was
-# up to 0.7% off; restarts changed the objective by about 1e-10 (median). The fit uses no threshold: `cut` only sets the
-# split for the diagnostic part-wise numbers returned with the fit (n_lo, n_hi, part centres and scales, flags).
-# f.D is the unpenalised D at the penalised optimum, f.D_pen the penalised objective.
+# Penalised objective D + λ (log s_high - log s_low)^2 at p = (θ*, log s_low, log s_high, log(ζ - ζ_min)), written for
+# ForwardDiff. u_n is found by Newton on Float64 values (`finv`), then one Newton correction with the (dual) parameters,
+# which at the solution gives the exact derivative du/dp = -(∂F/∂p) / F'(u). The variance is computed in two passes:
+# the one-pass formula (mean of squares minus squared mean) loses all precision at large ζ, where a gradient-based
+# optimiser then finds spurious negative "variances". Returns Inf where the value is not finite.
+function penalised_D(p::AbstractVector{S}, θ, α, λ, ζ_min) where S
+    θs, slo, shi, ζ = p[1], exp(p[2]), exp(p[3]), ζ_min + exp(p[4])
+    v = ForwardDiff.value
+    mv = TwoSlope(v(θs), v(slo), v(shi), v(ζ))
+    n = length(θ)
+    xs = Vector{S}(undef, n)
+    for i in 1:n
+        u0 = finv(mv, θ[i])
+        F = θs + ζ * (shi * log1pexp(u0 / ζ) - slo * log1pexp(-u0 / ζ))
+        Fp0 = slo * logistic(-u0 / ζ) + shi * logistic(u0 / ζ)
+        u = u0 - (F - θ[i]) / Fp0
+        Fp = slo * logistic(-u / ζ) + shi * logistic(u / ζ)
+        L1 = (shi - slo) * logistic(u / ζ) * logistic(-u / ζ) / (ζ * Fp)
+        xs[i] = Fp * α[i] + L1 + u
+    end
+    μ = sum(xs) / n
+    val = sum(x -> (x - μ)^2, xs) / n + λ * (p[3] - p[2])^2
+    return isfinite(v(val)) ? val : S(Inf)
+end
+
+# Fit a two-slope map to one coordinate: one BFGS run (ForwardDiff gradients of `penalised_D`, stopping when the largest
+# gradient component is below 1e-8) from each of three starts (split at the 25% and 75% quantiles, and the affine nutpie
+# map), keeping the start with the best penalised objective, evaluated with the reference `Dk`. On 150 coordinate fits
+# of stored insect populations BFGS was about 4 times faster than Nelder-Mead (2.7 s against 11.1 s for 10 coordinates of
+# about 4000 particles, plus about 4 s of compilation once per process) and at least as accurate: Nelder-Mead stalled
+# with ζ at its lower bound in a few fits (up to 0.5% worse). The three starts were chosen with Nelder-Mead (they reached
+# the best of five starts with two restarts each to within 6e-8). A start whose optimisation fails is skipped; if all do,
+# the equal-slope map is used. The fit uses no threshold: `cut` only sets the split for the diagnostic part-wise numbers
+# returned with the fit (n_lo, n_hi, part centres and scales, flags). f.D is the unpenalised D at the penalised optimum,
+# f.D_pen the penalised objective.
 function fit_twoslope(θ::AbstractVector, α::AbstractVector; cut=median(θ), ζ0=1.0, λ=DEFAULT_λN / length(θ), ζ_min=0.2)
     s_glob = nutpie_scale(θ, α)
     starts = [:q25 => split_start(θ, α, quantile(θ, 0.25); ζ0).m, :q75 => split_start(θ, α, quantile(θ, 0.75); ζ0).m,
@@ -105,12 +133,21 @@ function fit_twoslope(θ::AbstractVector, α::AbstractVector; cut=median(θ), ζ
     obj(p) = (v = Dk(to_map(p, ζ_min), θ, α) + λ * (p[3] - p[2])^2; isfinite(v) ? v : Inf)
     best = nothing
     for (name, m0) in starts
-        res = optimize(obj, from_map(m0, ζ_min), NelderMead(), Optim.Options(iterations=4000, f_reltol=1e-12, x_abstol=1e-10))
-        D = Optim.minimum(res)
-        if isnothing(best) || D < best.D_pen
-            m = to_map(Optim.minimizer(res), ζ_min)
-            best = (D=Dk(m, θ, α), D_pen=D, m=m, start=name, D_start=obj(from_map(m0, ζ_min)))
+        res = try
+            optimize(p -> penalised_D(p, θ, α, λ, ζ_min), from_map(m0, ζ_min), BFGS(),
+                Optim.Options(iterations=1000, g_tol=1e-8); autodiff=:forward)
+        catch
+            continue
         end
+        D_pen = obj(Optim.minimizer(res))
+        if isfinite(D_pen) && (isnothing(best) || D_pen < best.D_pen)
+            m = to_map(Optim.minimizer(res), ζ_min)
+            best = (D=Dk(m, θ, α), D_pen=D_pen, m=m, start=name, D_start=obj(from_map(m0, ζ_min)))
+        end
+    end
+    if isnothing(best)
+        m = equal_slope_map(θ, α)
+        best = (D=Dk(m, θ, α), D_pen=Dk(m, θ, α), m=m, start=:equal_slope_fallback, D_start=NaN)
     end
 
     # diagnostics relative to the split at `cut`
