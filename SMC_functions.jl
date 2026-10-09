@@ -5,7 +5,7 @@ include(joinpath(@__DIR__, "transform_maps.jl"));
 using Distributions, Random, StableRNGs, Statistics, StatsBase
 using Distances, LinearAlgebra, LogExpFunctions, NearestNeighbors
 using AdvancedHMC, Bijectors, LogDensityProblems, LogDensityProblemsAD, ForwardDiff, PreallocationTools
-using Accessors, DiffResults, JLD2, ProgressMeter
+using Accessors, Combinatorics, DiffResults, JLD2, ProgressMeter
 using Distributed: @everywhere, addprocs, myid, nprocs, nworkers, remotecall_fetch, workers
 using VideoIO
 
@@ -235,6 +235,82 @@ function qb_stepsize(
         stepsize = fit.stepsize
     end
     return stepsize
+end
+
+## Nutpie-style mass matrix
+function compute_invmass(particles, target, npass, prev_pop_info=nothing)
+    logp_func = Base.Fix1(LogDensityProblems.logdensity, target)
+
+    x1 = particles[1].state
+    d, n = length(x1), length(particles)
+    T = eltype(x1)
+
+    X = Matrix{T}(undef, d, n)
+    G = Matrix{T}(undef, d, n)
+    logp = Vector{T}(undef, n)
+
+    result = DiffResults.GradientResult(x1)
+    for (i, p) in enumerate(particles)
+        X[:, i] .= p.state
+        result = ForwardDiff.gradient!(result, logp_func, p.state)  # value + grad in one pass
+        logp[i] = DiffResults.value(result)
+        G[:, i] .= DiffResults.gradient(result)
+    end
+
+    keep = logp .>= quantile(logp, 0.01)   # drop bottom 1% by log target density
+    var_x     = vec(var(view(X, :, keep); dims = 2))
+    var_alpha = vec(var(view(G, :, keep); dims = 2))
+    invmass = sqrt.(var_x ./ var_alpha)
+    # display([sqrt.(var_x) sqrt.(var_alpha) invmass])
+    return (invmass = invmass,)   # inverse mass diagonal
+end
+
+## Population info for `nuts_invmass_move`: nutpie-style mass matrix plus the pool of step sizes
+# Use previous pool of step sizes weighted by how close the acceptance rate of the ancestor's last move was to the target.
+acc_weight(a; p=4, q=1) = isfinite(a) ? clamp(a, 0., 1.)^p * (1 - clamp(a, 0., 1.))^q : 0.
+
+# Particles without acceptance info (first iteration, no usable weights) give a uniform pool with a wide jitter.
+# Particles with `curr_acc_rate < min_acc_rate` can additionally be excluded outright (disabled by default); if 
+# that would exclude everyone, the filter is ignored.
+function compute_FT_info(
+    particles, target, npass, prev_pop_info=nothing; jitter=0.2, init_jitter=0.2, min_acc_rate=0.0,
+    weight_func=acc_weight,
+)
+    stepsizes = [p.stepsize for p in particles]
+    accs = [
+        hasproperty(p.info, :curr_acc_rate) ? p.info.curr_acc_rate : NaN
+        for p in particles
+    ]
+    valid_step = isfinite.(stepsizes) .& (stepsizes .> 0)
+    acc_ok = .!(accs .< min_acc_rate)
+    any(valid_step .& acc_ok) && (valid_step = valid_step .& acc_ok)
+    ws = [valid_step[i] ? weight_func(accs[i]) : 0. for i in eachindex(particles)]
+    if sum(ws) > 0
+        used_jitter = jitter
+    else
+        ws = Float64.(valid_step)
+        used_jitter = init_jitter
+    end
+    cum_probs = cumsum(ws ./ sum(ws))
+    cum_probs[end] = 1.0
+    return merge(
+        compute_invmass(particles, target, npass),
+        (stepsizes = stepsizes, cum_probs = cum_probs, jitter = used_jitter),
+    )
+end
+
+
+# The mass matrix is estimated from the population before the first round of an SMC iteration and reused from
+# `prev_pop_info` in its later rounds; the step size is updated every round. `refit_each_pass=true` re-estimates the mass
+# matrix before every round, as runs before this option did.
+function compute_QB_info(
+    particles, target, npass, prev_pop_info=nothing; acc_target=0.8, jitter=0.2, max_dlog=Inf, use_ngrad=false,
+    min_obs=20, refit_each_pass=false,
+)
+    stepsize = qb_stepsize(particles, npass, prev_pop_info; acc_target, max_dlog, use_ngrad, min_obs)
+    invmass = (isnothing(prev_pop_info) || refit_each_pass) ? compute_invmass(particles, target, npass).invmass :
+        prev_pop_info.invmass
+    return (invmass = invmass, stepsize = stepsize, jitter = jitter)
 end
 
 ## Population info for `nuts_transformed_move`: per-coordinate two-slope maps (transform_maps.jl) and the step size
@@ -820,15 +896,28 @@ function load_SMC_wall(fname)
     end
 end
 
+# Indices of the states in each spike/slab class: the key has one entry per coordinate in `ss_idxs`, true where the
+# coordinate exceeds `thres`.
+function partition_by_thres(states::AbstractVector, thres::Float64, ss_idxs)
+    classes = Dict{BitVector, Vector{Int}}()
+    for (i, θ) in enumerate(states)
+        key = BitVector(θ[j] > thres for j in ss_idxs)
+        push!(get!(classes, key, Int[]), i)
+    end
+    return classes
+end
+
 # Log-odds of the conditional marginal posterior p(z_j = 1 | k_j, ψ) (eq:combi_cond_zpost) for a spike-and-slab
 # coordinate x = log10 k_j, with inclusion probability logistic(logit_p). The log10 Jacobian is common to the spike
-# and slab densities, so it cancels. Uses the globals `slab_prior` and `spike_prior`.
-cond_incl_logodds(x, logit_p) = logpdf(slab_prior, x) - logpdf(spike_prior, x) + logit_p
+# and slab densities, so it cancels.
+cond_incl_logodds(x, logit_p, slab_prior, spike_prior) = logpdf(slab_prior, x) - logpdf(spike_prior, x) + logit_p
 
 # Monte Carlo estimate of the model posterior p(z | y) (eq:combi_zpost): the (weighted) average over particles of
 # p(z | k_n, ψ_n) = Π_j p(z_j | k_{n,j}, ψ_n). `logit_p(θ)` returns the logit of the inclusion probability
-# (0 for p = 1/2). Models are ordered as in `combinations(1:n_ss)`.
-function get_mode_probs(states, Ws=ones(length(states)); logit_p=Returns(0.0))
+# (0 for p = 1/2). `ss_idxs` are the spike-and-slab coordinates (n_ss of them); models are ordered as in
+# `combinations(1:n_ss)`.
+function get_mode_probs(states, ss_idxs, slab_prior, spike_prior, Ws=ones(length(states)); logit_p=Returns(0.0))
+    n_ss = length(ss_idxs)
     lookup = zeros(Int, 2^n_ss)
     for (i, elems) in enumerate(combinations(1:n_ss))
         idx = 0
@@ -844,7 +933,7 @@ function get_mode_probs(states, Ws=ones(length(states)); logit_p=Returns(0.0))
     for (state, W) in zip(states, Ws)
         lp = logit_p(state)
         for j in 1:n_ss
-            l = cond_incl_logodds(state[ss_idxs[j]], lp)
+            l = cond_incl_logodds(state[ss_idxs[j]], lp, slab_prior, spike_prior)
             q1[j], q0[j] = logistic(l), logistic(-l)
         end
         for idx in 0:(2^n_ss - 1)
@@ -859,7 +948,8 @@ function get_mode_probs(states, Ws=ones(length(states)); logit_p=Returns(0.0))
 end
 
 # Implied-model approximation: each particle counts towards the single model with z_j = 1 iff θ[ss_idxs[j]] > thres.
-function get_implied_mode_probs(states, thres, Ws=ones(length(states)))
+function get_implied_mode_probs(states, thres, ss_idxs, Ws=ones(length(states)))
+    n_ss = length(ss_idxs)
     lookup = zeros(Int, 2^n_ss)
     for (i, elems) in enumerate(combinations(1:n_ss))
         idx = 0
@@ -882,11 +972,12 @@ function get_implied_mode_probs(states, thres, Ws=ones(length(states)))
     return counts ./ sum(Ws)
 end
 
-function get_pvec(particles, Ws=ones(length(particles)); logit_p=Returns(0.0))
-    return get_mode_probs(getproperty.(particles, :state), Ws; logit_p)
+function get_pvec(particles, ss_idxs, slab_prior, spike_prior, Ws=ones(length(particles)); logit_p=Returns(0.0))
+    return get_mode_probs(getproperty.(particles, :state), ss_idxs, slab_prior, spike_prior, Ws; logit_p)
 end
 
-function make_fig(particles, iter, ss_idxs, ps)
+# Pair plot of a population; `ps` are the parameter symbols, labelled through `sym2label`.
+function make_fig(particles, iter, ss_idxs, ps, sym2label)
     pop_size = length(particles)
     f = plot_pairs(
         getproperty.(particles, :state);

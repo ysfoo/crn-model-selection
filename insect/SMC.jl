@@ -118,18 +118,9 @@ function run_5_3(particles, last_n_nuts, npass, states_before_move; verbose = 0,
     return npass < 3 ? 5 : 0
 end
 
-function partition_by_thres(states::AbstractVector, thres::Float64; ss_idxs=4:9)
-    classes = Dict{BitVector, Vector{Int}}()
-    for (i, θ) in enumerate(states)
-        key = BitVector(θ[j] > thres for j in ss_idxs)
-        push!(get!(classes, key, Int[]), i)
-    end
-    return classes
-end
-
 function n_nuts_by_kendall(
     particles, last_n_nuts, npass, prev_states;
-    thres=thres, init_n_nuts=10, min_count=20,
+    thres=thres, ss_idxs=ss_idxs, init_n_nuts=10, min_count=20,
     verbose=0, rng=Random.default_rng(),
 )
     if isnothing(last_n_nuts)
@@ -138,7 +129,7 @@ function n_nuts_by_kendall(
 
     D = length(prev_states[1])
     curr_states = [p.state for p in particles]
-    prev_classes = partition_by_thres(prev_states, thres)
+    prev_classes = partition_by_thres(prev_states, thres, ss_idxs)
 
     for (key, pre_idxs) in prev_classes
         n_idxs = length(pre_idxs)
@@ -164,7 +155,7 @@ end
 # Decide whether to extend NUTS based on detailed balance.
 function n_nuts_by_detbal(
     particles, last_n_nuts, npass, states_before_move;
-    thres=thres, init_n_nuts=10, 
+    thres=thres, init_n_nuts=10, ss_idxs=ss_idxs,
     pseudocount=0.1, n_rand=10_000,
     verbose=0, rng=Random.default_rng(),
 )
@@ -181,8 +172,8 @@ function n_nuts_by_detbal(
     prev_states = [p.state .- p.info.delta for p in particles]
     curr_states = [p.state for p in particles]
 
-    prev_classes = partition_by_thres(prev_states, thres)
-    curr_classes = partition_by_thres(curr_states, thres)
+    prev_classes = partition_by_thres(prev_states, thres, ss_idxs)
+    curr_classes = partition_by_thres(curr_states, thres, ss_idxs)
 
     # Label the components (spike/slab modes).
     keys_union = unique([collect(keys(prev_classes)); collect(keys(curr_classes))])
@@ -245,82 +236,6 @@ function n_nuts_by_detbal(
     return reject ? init_n_nuts : 0
 end
 
-
-## Nutpie-style mass matrix
-function compute_invmass(particles, target, npass, prev_pop_info=nothing)
-    logp_func = Base.Fix1(LogDensityProblems.logdensity, target)
-
-    x1 = particles[1].state
-    d, n = length(x1), length(particles)
-    T = eltype(x1)
-
-    X = Matrix{T}(undef, d, n)
-    G = Matrix{T}(undef, d, n)
-    logp = Vector{T}(undef, n)
-
-    result = DiffResults.GradientResult(x1)
-    for (i, p) in enumerate(particles)
-        X[:, i] .= p.state
-        result = ForwardDiff.gradient!(result, logp_func, p.state)  # value + grad in one pass
-        logp[i] = DiffResults.value(result)
-        G[:, i] .= DiffResults.gradient(result)
-    end
-
-    keep = logp .>= quantile(logp, 0.01)   # drop bottom 1% by log target density
-    var_x     = vec(var(view(X, :, keep); dims = 2))
-    var_alpha = vec(var(view(G, :, keep); dims = 2))
-    invmass = sqrt.(var_x ./ var_alpha)
-    # display([sqrt.(var_x) sqrt.(var_alpha) invmass])
-    return (invmass = invmass,)   # inverse mass diagonal
-end
-
-## Population info for `nuts_invmass_move`: nutpie-style mass matrix plus the pool of step sizes
-# Use previous pool of step sizes weighted by how close the acceptance rate of the ancestor's last move was to the target.
-acc_weight(a; p=4, q=1) = isfinite(a) ? clamp(a, 0., 1.)^p * (1 - clamp(a, 0., 1.))^q : 0.
-
-# Particles without acceptance info (first iteration, no usable weights) give a uniform pool with a wide jitter.
-# Particles with `curr_acc_rate < min_acc_rate` can additionally be excluded outright (disabled by default); if 
-# that would exclude everyone, the filter is ignored.
-function compute_FT_info(
-    particles, target, npass, prev_pop_info=nothing; jitter=0.2, init_jitter=0.2, min_acc_rate=0.0,
-    weight_func=acc_weight,
-)
-    stepsizes = [p.stepsize for p in particles]
-    accs = [
-        hasproperty(p.info, :curr_acc_rate) ? p.info.curr_acc_rate : NaN
-        for p in particles
-    ]
-    valid_step = isfinite.(stepsizes) .& (stepsizes .> 0)
-    acc_ok = .!(accs .< min_acc_rate)
-    any(valid_step .& acc_ok) && (valid_step = valid_step .& acc_ok)
-    ws = [valid_step[i] ? weight_func(accs[i]) : 0. for i in eachindex(particles)]
-    if sum(ws) > 0
-        used_jitter = jitter
-    else
-        ws = Float64.(valid_step)
-        used_jitter = init_jitter
-    end
-    cum_probs = cumsum(ws ./ sum(ws))
-    cum_probs[end] = 1.0
-    return merge(
-        compute_invmass(particles, target, npass),
-        (stepsizes = stepsizes, cum_probs = cum_probs, jitter = used_jitter),
-    )
-end
-
-
-# The mass matrix is estimated from the population before the first round of an SMC iteration and reused from
-# `prev_pop_info` in its later rounds; the step size is updated every round. `refit_each_pass=true` re-estimates the mass
-# matrix before every round, as runs before this option did.
-function compute_QB_info(
-    particles, target, npass, prev_pop_info=nothing; acc_target=0.8, jitter=0.2, max_dlog=Inf, use_ngrad=false,
-    min_obs=20, refit_each_pass=false,
-)
-    stepsize = qb_stepsize(particles, npass, prev_pop_info; acc_target, max_dlog, use_ngrad, min_obs)
-    invmass = (isnothing(prev_pop_info) || refit_each_pass) ? compute_invmass(particles, target, npass).invmass :
-        prev_pop_info.invmass
-    return (invmass = invmass, stepsize = stepsize, jitter = jitter)
-end
 
 ## Fisher-Rao path
 abstract type FRStrategy end

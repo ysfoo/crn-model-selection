@@ -50,7 +50,7 @@ function summarise_run(fname)
     all_particles, iter, targetinfos, npass_vec, smc_times = load_SMC(fname)
     moved = all_particles[2:end]
     return (;
-        pvec = get_pvec(all_particles[end]),
+        pvec = get_pvec(all_particles[end], ss_idxs, slab_prior, spike_prior),
         γs = extract_γ.(targetinfos), # includes γ = 0
         smc_times, npass_vec,
         n_nuts = [ps[1].n_nuts for ps in moved],
