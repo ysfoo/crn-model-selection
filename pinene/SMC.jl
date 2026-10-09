@@ -1,4 +1,5 @@
 include(joinpath(@__DIR__, "../SMC_functions.jl"));
+include(joinpath(@__DIR__, "../process_setup.jl"));
 include(joinpath(@__DIR__, "../ODE_LDP.jl"));
 include(joinpath(@__DIR__, "setup.jl"));
 
@@ -6,18 +7,8 @@ using DiffResults, Optim, StatsFuns
 using BSplineKit, SparseArrays
 import RegularizationTools
 
-# Worker processes for `parallel = :distributed` (none unless the environment variable SMC_NWORKERS is set; see
-# `start_SMC_workers`). They are started before pinning because they inherit the CPU affinity of the master thread, and
-# are left unpinned: pinning the single thread of every worker to the first allowed CPU would put them all on one core.
-start_SMC_workers()
-
-using ThreadPinning
-isslurmjob() = get(ENV, "SLURM_JOBID", "") != ""
-if myid() == 1 && nprocs() == 1
-    isslurmjob() ? pinthreads(:affinitymask) : pinthreads(:cores);
-end
-
-LinearAlgebra.BLAS.set_num_threads(1)
+# Workers for `parallel = :distributed`, thread pinning and single-threaded BLAS (see process_setup.jl)
+setup_SMC_process()
 
 # Single dataset (see `setup.jl`). All `n_rx` candidate reactions have a spike-and-slab prior (none are fixed), 
 # one noise parameter per species, logit-transformed inclusion probability for each candidate reaction.

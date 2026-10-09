@@ -6,7 +6,7 @@ using Distributions, Random, StableRNGs, Statistics, StatsBase
 using Distances, LinearAlgebra, LogExpFunctions, NearestNeighbors
 using AdvancedHMC, Bijectors, LogDensityProblems, LogDensityProblemsAD, ForwardDiff, PreallocationTools
 using Accessors, Combinatorics, DiffResults, JLD2, ProgressMeter
-using Distributed: @everywhere, addprocs, myid, nprocs, nworkers, remotecall_fetch, workers
+using Distributed: myid, nprocs, nworkers, remotecall_fetch, workers
 using VideoIO
 
 
@@ -380,9 +380,10 @@ adapt_using_curr(info) = 1.5^((info.curr_acc_rate-0.8)/0.2)
 #   :serial      - one loop on the calling thread;
 #   :threads     - one task per Julia thread, each with its own copy of the target, taking particles one at a time from a
 #                  shared counter (so slow particles do not hold up a fixed block of others);
-#   :distributed - Distributed.jl worker processes (see `start_SMC_workers`). Each remote call rebuilds the target from
-#                  `(ldp_builder, prior_path, γ)` on the worker and processes a batch of particles. Every process has its
-#                  own heap, so a garbage collection on one worker does not stop the others.
+#   :distributed - Distributed.jl worker processes (see `start_SMC_workers` in process_setup.jl). Each remote call
+#                  rebuilds the target from `(ldp_builder, prior_path, γ)` on the worker and processes a batch of
+#                  particles. Every process has its own heap, so a garbage collection on one worker does not stop the
+#                  others.
 # Each particle is moved with its own RNG, StableRNG(seed), with the seeds drawn from the master RNG before each round,
 # so results do not depend on the backend, on the number of threads or workers, or on which particle finishes first.
 
@@ -392,38 +393,8 @@ function resolve_backend(parallel)
     parallel in (:serial, :threads, :distributed) ||
         throw(ArgumentError("parallel must be :serial, :threads or :distributed (got $(repr(parallel)))"))
     parallel === :distributed && nprocs() == 1 &&
-        throw(ArgumentError("parallel = :distributed, but there are no worker processes (see start_SMC_workers)"))
+        throw(ArgumentError("parallel = :distributed, but there are no worker processes (see start_SMC_workers in process_setup.jl)"))
     return parallel
-end
-
-# Starts `n` worker processes for `parallel = :distributed` and makes each of them run `script` (by default the script
-# the master is running) with the master's command-line arguments, so that every definition in the problem script (prior
-# path, likelihood builder, move function, ...) also exists on the workers. `run_SMC` and `resume_SMC` return at once on
-# a worker, so only the master runs SMC; anything else the script does at top level runs on every process, so it must be
-# safe to repeat (e.g. `mkpath`, not copying or deleting files). Workers have one thread each.
-# Call this before pinning threads: worker processes inherit the CPU affinity of the master thread that starts them.
-# It does nothing on a worker, when `n == 0` or when workers already exist. `n` defaults to the environment variable
-# SMC_NWORKERS (unset: 0) and `heap_size_hint` (per worker) to SMC_WORKER_HEAP (unset: 2G).
-function start_SMC_workers(;
-    n=parse(Int, get(ENV, "SMC_NWORKERS", "0")), heap_size_hint=get(ENV, "SMC_WORKER_HEAP", "2G"),
-    script=PROGRAM_FILE,
-)
-    (myid() == 1 && n > 0 && nprocs() == 1) || return nothing
-    isempty(script) && error("start_SMC_workers needs the path of the problem script (there is none in an interactive session)")
-    script_path = abspath(script)
-    args = copy(ARGS)
-    t = @elapsed begin
-        addprocs(n; exeflags=`--project=$(Base.active_project()) --threads=1 --heap-size-hint=$heap_size_hint`)
-        @everywhere workers() begin
-            empty!(ARGS)
-            append!(ARGS, $args)
-            include($script_path)
-        end
-    end
-    @info "Started $n worker processes running $script_path in $(round(t; digits=1)) s"
-    flush(stdout)
-    flush(stderr)
-    return nothing
 end
 
 # Applies `f(target, args, item)` to every element of `items` with the given backend and returns the results in order.
@@ -769,7 +740,7 @@ function run_SMC(
     verbose=0, vid_path=nothing, make_fig=nothing,
     parallel=:serial, pbar_lines=pop_size, rng=Random.default_rng(), max_iter=typemax(Int),
 )
-    myid() == 1 || return nothing  # workers only serve the master (see `start_SMC_workers`)
+    myid() == 1 || return nothing  # workers only serve the master (see `start_SMC_workers` in process_setup.jl)
     parallel = resolve_backend(parallel)
     log_backend(parallel)
     initstates = [init_sampler(rng) for _ in 1:init_pop_size] 
@@ -834,7 +805,7 @@ function resume_SMC(
     verbose=0, vid_path=nothing, make_fig=nothing,
     parallel=:serial, pbar_lines=pop_size, rng=Random.default_rng(), max_iter=typemax(Int),
 )
-    myid() == 1 || return nothing  # workers only serve the master (see `start_SMC_workers`)
+    myid() == 1 || return nothing  # workers only serve the master (see `start_SMC_workers` in process_setup.jl)
     parallel = resolve_backend(parallel)
     log_backend(parallel)
     prior_path_arg = prior_path

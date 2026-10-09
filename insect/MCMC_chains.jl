@@ -2,6 +2,7 @@
 include(joinpath(@__DIR__, "setup.jl"));
 include(joinpath(@__DIR__, "ldp_setup.jl"));
 include(joinpath(@__DIR__, "nuts_helpers.jl"));
+include(joinpath(@__DIR__, "../process_setup.jl"));
 
 # With MCMC_NWORKERS set, chains run on that many single-thread worker processes; otherwise one chain per thread.
 start_nuts_workers(joinpath.(@__DIR__, ["setup.jl", "ldp_setup.jl", "nuts_helpers.jl"]))
@@ -21,9 +22,8 @@ using OrdinaryDiffEq
 using JLD2, ProgressMeter, Random, PDMats, StableRNGs, Suppressor
 using AdvancedHMC, LinearAlgebra, LogDensityProblems, MCMCChains
 
-using ThreadPinning
-isslurmjob() = get(ENV, "SLURM_JOBID", "") != ""
-parallel === :threads && (isslurmjob() ? pinthreads(:affinitymask) : pinthreads(:cores));
+# Pin threads only without workers, as in the SMC drivers (see process_setup.jl)
+pin_threads_without_workers()
 
 # Load ground truth, data, MAP results.
 @load joinpath(@__DIR__, "data.jld2") all_data;

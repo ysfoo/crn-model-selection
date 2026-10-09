@@ -6,10 +6,6 @@ include(joinpath(@__DIR__, "setup.jl"));
 using Distributions, LinearAlgebra, Optim
 using JLD2
 
-using ThreadPinning
-isslurmjob() = get(ENV, "SLURM_JOBID", "") != ""
-isslurmjob() ? pinthreads(:affinitymask) : pinthreads(:cores);
-
 LinearAlgebra.BLAS.set_num_threads(1)
 
 rx_sys = models[end]
