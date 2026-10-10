@@ -50,16 +50,10 @@ final_dists = [
 ];
 final_logprior_func(θ) = sum(logpdf(dist, val) for (dist, val) in zip(final_dists, θ));
 
-extract_γ(targetinfo) = begin
-    hasproperty(targetinfo, :γ) && return targetinfo.γ
-    hasproperty(targetinfo, :β) && return targetinfo.β
-    return last(targetinfo)    
-end
-
 convert_HMS(s) = string(floor(Int, s÷3600), ":", lpad(floor(Int, s%3600÷60), 2, '0'), ":", lpad(floor(Int, s%60), 2, '0'));
 
 # Load previous results
-logZs_fname = joinpath(@__DIR__, "output/logZs.jld2");
+logZs_fname = joinpath(@__DIR__, "output/logZs_backup.jld2");
 @load logZs_fname rAMIS_logZvecs BS_logZvecs all_times;
 pvecs_BS = [exp.(logZvec .- logsumexp(logZvec)) for logZvec in BS_logZvecs];
 pvecs_rAMIS = [exp.(logZvec .- logsumexp(logZvec)) for logZvec in rAMIS_logZvecs];
@@ -68,7 +62,7 @@ tvds_rAMIS = [0.5sum(abs, pvec_BS .- pvec_rAMIS) for (pvec_BS, pvec_rAMIS) in zi
 ### End setup
 
 ## Load SMC results
-run_str = "SMC505"
+run_str = "SMC435"
 psize_str = "4k"
 SMC_fname = joinpath(@__DIR__, "output/$(run_str)_$(psize_str).jld2");
 
@@ -82,7 +76,7 @@ if isfile(SMC_fname)
 end;
 
 tmp = 0;
-@showprogress for dir_idx in 1:n_feasible
+@showprogress for dir_idx in 28:n_feasible
     fname = joinpath(@__DIR__, "output/data$(dir_idx)/$(run_str)_$(psize_str).jld2")
     if hours_SMC[dir_idx] > 0
         tmp += 1
@@ -90,7 +84,13 @@ tmp = 0;
         continue
     end
     if isfile(fname)
-        all_particles, iter, targetinfos, npass_vec, smc_times = load_SMC(fname);
+        all_particles, iter, targetinfos, npass_vec, smc_times = 
+            try 
+                load_SMC(fname);
+            catch e
+                println("Could not load $fname")
+                rethrow()
+            end
         # println(targetinfos[end])
         if extract_γ(targetinfos[end]) == 1.
             tmp += 1
@@ -103,85 +103,31 @@ tmp = 0;
         end
     end
 end
-tvds_SMC = [dir_idx => 0.5sum(abs, pvec_BS .- pvec_SMC) for (dir_idx, pvec_BS, pvec_SMC) in zip(1:n_feasible, pvecs_BS, pvecs_SMC) if !isempty(pvec_SMC)];
+tvds_SMC = [
+    dir_idx => 0.5sum(abs, pvec_BS .- pvec_SMC) for (dir_idx, pvec_BS, pvec_SMC) 
+    in zip(1:n_feasible, pvecs_BS, pvecs_SMC) if !isempty(pvec_SMC)
+];
 
 tmp
 # findall(isempty.(pvecs_SMC))
 
-summarystats(last.(tvds_SMC)) |> display
 tvds_SMC
-sort(tvds_SMC, by=last)[end-9:end]
+sort(tvds_SMC, by=last)
+summarystats(last.(tvds_SMC))
 
-println(round.(Int, filter(!iszero, hours_SMC)))
+println(round.(filter(!iszero, hours_SMC); digits=1))
 println(filter(!iszero, ns_nuts))
 println(filter(!iszero, length.(targetinfos_vec)) .- 1)
 
-summarystats(filter(!iszero, hours_SMC)) |> display
-summarystats(filter(!iszero, ns_nuts)) |> display
-summarystats(filter(!iszero, length.(targetinfos_vec)) .- 1) |> display
+summarystats(filter(!iszero, hours_SMC))
+summarystats(filter(!iszero, ns_nuts))
+summarystats(filter(!iszero, length.(targetinfos_vec)) .- 1)
 
 hist(filter(!iszero, hours_SMC), axis=(xlabel="Computational time (hours)",))
 hist(filter(!iszero, ns_nuts), axis=(xlabel="Number of NUTS iterations",))
 hist(filter(!iszero, length.(targetinfos_vec)) .- 1, axis=(xlabel="Number of SMC iterations", xticks=1:100))
 
 @save SMC_fname pvecs_SMC hours_SMC ns_nuts targetinfos_vec;
-
-## Check some individual runs
-
-dir_idx = 4
-
-# SMC872_5k
-run_str = "SMC872_5k"
-OUTDIR = joinpath(@__DIR__, "output/data$(dir_idx)");
-fname = "$OUTDIR/$(run_str).jld2"
-@load fname all_particles iter targetinfos smc_times;
-var(reduce(hcat, getproperty.(all_particles[1], :state)), dims=2)
-
-pvec_SMC = get_pvec(all_particles[end], ss_idxs, slab_prior, spike_prior);
-0.5sum(abs, pvecs_BS[dir_idx] .- pvec_SMC)
-esjds_872 = [[esjd_per_nuts(particle) for particle in particles] for particles in all_particles[2:end]];
-
-fig = make_fig(all_particles[end], iter, ss_idxs, ps, sym2label)
-vid_path = joinpath(@__DIR__, "imgs/$(run_str)/data$(dir_idx)") |> mkpath;
-save(joinpath(vid_path, "iter$(iter).png"), fig, px_per_unit=4);
-
-# SMC762 (5k)
-run_str = "SMC762_5k"
-OUTDIR = joinpath(@__DIR__, "output/data$(dir_idx)");
-fname = "$OUTDIR/$(run_str).jld2"
-@load fname all_particles iter targetinfos smc_times;
-var(reduce(hcat, getproperty.(all_particles[1], :state)), dims=2)
-
-length(all_particles[end])
-pvec_SMC = get_pvec(all_particles[end], ss_idxs, slab_prior, spike_prior);
-0.5sum(abs, pvecs_BS[dir_idx] .- pvec_SMC)
-esjds_762 = [[esjd_per_nuts(particle) for particle in particles] for particles in all_particles[2:end]];
-
-fig = make_fig(all_particles[end], iter, ss_idxs, ps, sym2label)
-vid_path = joinpath(@__DIR__, "imgs/$(run_str)/data$(dir_idx)") |> mkpath;
-save(joinpath(vid_path, "iter$(iter).png"), fig, px_per_unit=4);
-
-begin
-    f = Figure()
-    ax = Axis(f[1,1], xlabel="SMC iteration", ylabel=L"\log_{10} \text{ESJD}",)
-    color = Makie.wong_colors()[1]
-    for (iter, esjd_vec) in enumerate(esjds_872)
-        boxplot!(
-            fill(iter - 0.2, length(esjd_vec)), esjd_vec .|> log10, width=0.5, 
-            color=color, whiskercolor=whiskercolor,
-            outliercolor=(color, 0.5), markersize=6
-        )
-    end
-    color = Makie.wong_colors()[2]
-    for (iter, esjd_vec) in enumerate(esjds_762)
-        boxplot!(
-            fill(iter + 0.2, length(esjd_vec)), esjd_vec .|> log10, width=0.5, 
-            color=Makie.wong_colors()[2], whiskercolor=Makie.wong_colors()[2],
-            outliercolor=(:grey, 0.5), markersize=6
-        )
-    end    
-    display(f)
-end
 
 
 ## Plots of TVD and pvec

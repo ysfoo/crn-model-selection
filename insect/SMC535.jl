@@ -1,6 +1,6 @@
 include(joinpath(@__DIR__, "SMC.jl"))
 
-run_str = "SMC545"
+run_str = "SMC535"
 σ0 = sqrt(68);
 unimodal_prior = Normal(μ0, σ0);
 unimodal_dists = [
@@ -12,13 +12,15 @@ unimodal_logprior_func(θ) = sum(logpdf(dist, val) for (dist, val) in zip(unimod
 
 init_dists = unimodal_dists; 
 move_func = nuts_invmass_move;  init_stepsize = 0.5;
-n_nuts_func = repeat_5;
+n_nuts_func = repeat_5_min_2;
 ldp_builder = make_ldp;
 prior_path(θ, γ) = γ * final_logprior_func(θ) + (1-γ) * unimodal_logprior_func(θ);
 
 init_sampler = (rng) -> rand.(Ref(rng), init_dists);
 
-psize_str = "4k"; pop_size = 4000; target_ess = 0.8pop_size; init_pop_size = pop_size;
+psize_str = length(ARGS) >= 2 ? ARGS[2] : "4k"
+pop_size = Dict("1k" => 1000, "2k" => 2000, "4k" => 4000, "8k" => 8000)[psize_str]; 
+target_ess = 0.8pop_size; init_pop_size = pop_size;
 
 fname = joinpath(@__DIR__, "output/data$(dir_idx)/$(run_str)_$(psize_str).jld2");
 display(fname)

@@ -1,7 +1,8 @@
 ### Compare the three SMC distribution paths on the 44 insect data sets: number of SMC iterations,
 ### TVD of model posterior probabilities from bridge sampling against runtime, and per-iteration diagnostics.
-### Set `LOAD_SUMMARIES` to false to recompute summaries from the per-data-set SMC outputs (slow: loads every run).
-### Recomputing also overwrites the summary files `output/<run>.jld2` read by `SMC_results.jl`.
+### Runs in `run_strs` that are missing from the stored summaries are summarised from the per-data-set SMC outputs
+### (slow: loads every run). Set `LOAD_SUMMARIES` to false to recompute all of them.
+### Summarising also writes the files `output/<run>.jld2` read by `SMC_results.jl`, unless they exist.
 
 include(joinpath(@__DIR__, "setup.jl"));
 include(joinpath(@__DIR__, "../SMC_functions.jl"));
@@ -17,15 +18,9 @@ n_ss = length(ss_idxs)
 slab_prior, spike_prior = Normal(μ_slab, σ_slab), Normal(μ_spike, σ_spike);
 thres = 0.5 * (μ_spike + μ_slab);
 
-extract_γ(targetinfo) = begin
-    hasproperty(targetinfo, :γ) && return targetinfo.γ
-    hasproperty(targetinfo, :β) && return targetinfo.β
-    return last(targetinfo)
-end
-
 psize_str = "4k"
 pop_size = 4000
-run_strs = ["SMC205", "SMC505", "SMC305"];
+run_strs = ["SMC035", "SMC135", "SMC435"]; # transformed-target NUTS; earlier figures used SMC205, SMC505, SMC305
 path_names = ["Power posteriors", "Alt. geometric path", "Non-geometric path"];
 path_ticks = ["Power\nposteriors", "Alt.\ngeometric", "Non-\ngeometric"];
 n_paths = length(run_strs)
@@ -61,11 +56,11 @@ end
 
 summ_fname = joinpath(@__DIR__, "output/SMC_paths_$(psize_str).jld2");
 LOAD_SUMMARIES = true;
-if LOAD_SUMMARIES
-    @load summ_fname summaries
-else
-    summaries = Dict{String, Vector{Any}}()
-    for run_str in run_strs
+# Stored summaries are kept; runs missing from them are summarised and added
+summaries = LOAD_SUMMARIES && isfile(summ_fname) ? load(summ_fname, "summaries") : Dict{String, Vector{Any}}()
+new_runs = filter(!in(keys(summaries)), run_strs)
+if !isempty(new_runs)
+    for run_str in new_runs
         runs = Vector{Any}(undef, n_feasible)
         @showprogress desc=run_str for dir_idx in 1:n_feasible
             fname = joinpath(@__DIR__, "output/data$(dir_idx)/$(run_str)_$(psize_str).jld2")
@@ -74,12 +69,13 @@ else
         end
         summaries[run_str] = runs
 
-        # Same format as `SMC_results.jl`
+        # Same format as `SMC_results.jl`; an existing file (e.g. written by `SMC_results.jl`) is kept
         pvecs_SMC = [r.pvec for r in runs]
         hours_SMC = [sum(r.smc_times) / 3600 for r in runs]
         ns_nuts = [sum(r.n_nuts) for r in runs]
         targetinfos_vec = [[(; γ) for γ in r.γs] for r in runs]
-        @save joinpath(@__DIR__, "output/$(run_str)_$(psize_str).jld2") pvecs_SMC hours_SMC ns_nuts targetinfos_vec
+        run_fname = joinpath(@__DIR__, "output/$(run_str)_$(psize_str).jld2")
+        isfile(run_fname) || @save run_fname pvecs_SMC hours_SMC ns_nuts targetinfos_vec
     end
     @save summ_fname summaries
 end
@@ -87,7 +83,7 @@ end
 @assert length(summaries[run_strs[1]][1].pvec) == length(pvecs_BS[1])
 
 n_iters = [[length(r.γs) - 1 for r in summaries[s]] for s in run_strs];
-hours = [[sum(r.smc_times) / 3600 for r in summaries[s]] for s in run_strs];
+minutes = [[sum(r.smc_times) / 60 for r in summaries[s]] for s in run_strs];
 # NUTS transitions per particle over the whole run (every particle performs the same number in an iteration)
 ns_nuts = [[sum(r.n_nuts) for r in summaries[s]] for s in run_strs];
 # Leapfrog steps (gradient evaluations) per particle over the whole run, averaged over the population
@@ -97,7 +93,7 @@ tvds = [[calc_tvd(r.pvec, p) for (r, p) in zip(summaries[s], pvecs_BS)] for s in
 missing_mass = [[sum(p[r.pvec .== 0]) for (r, p) in zip(summaries[s], pvecs_BS)] for s in run_strs];
 
 for (i, s) in enumerate(run_strs)
-    @info path_names[i] s median(n_iters[i]) median(hours[i]) median(tvds[i]) maximum(tvds[i]) median(missing_mass[i]) maximum(missing_mass[i])
+    @info path_names[i] s median(n_iters[i]) median(minutes[i]) median(tvds[i]) maximum(tvds[i]) median(missing_mass[i]) maximum(missing_mass[i])
 end
 
 ## Figure
@@ -118,11 +114,11 @@ end
 begin
     f = Figure(size=(1000, 800))
 
-    # A: number of SMC iterations
+    # D: number of SMC iterations
     iter_bins = (minimum(minimum.(n_iters)) - 0.5):1:(maximum(maximum.(n_iters)) + 0.5)
     iter_histmaxs = [maximum(fit(Histogram, v, iter_bins).weights) for v in n_iters]
     ax = Axis(
-        f[1,1],
+        f[2,2],
         limits=((0.2, 3.15), nothing),
         ylabel="Number of SMC iterations", ylabelsize=18,
         title="Length of SMC runs", titlesize=18,
@@ -137,11 +133,11 @@ begin
         hist_baseline!(ax, n_iters[i], iter_bins, i; color=PATH_COLORS[i])
     end
 
-    # B: TVD from bridge sampling
+    # A: TVD from bridge sampling
     tvd_bins = 0:0.02:(ceil(maximum(maximum.(tvds)) / 0.02) * 0.02)
     tvd_histmaxs = [maximum(fit(Histogram, v, tvd_bins).weights) for v in tvds]
     axB = ax = Axis(
-        f[1,2],
+        f[1,1],
         limits=((0.6, 3.12), (-0.005, nothing)),
         ylabel="Total variation distance\nfrom bridge sampling", ylabelsize=18,
         title="Accuracy of model posterior", titlesize=18,
@@ -157,29 +153,27 @@ begin
     end
 
     # C: TVD against runtime
-    hour_ticks = [10, 20, 50, 100, 200]
     ax = Axis(
         f[2,1],
         limits=(nothing, (-0.005, nothing)),
-        xscale=log10, xticks=hour_ticks,
-        xminorticks=[30, 40, 60, 70, 80, 90], xminorticksvisible=true, xminorticksize=5,
-        xlabel="Runtime (hours)", xlabelsize=18,
+        xticks=60:30:180,
+        xlabel="Runtime (minutes)", xlabelsize=18,
         ylabel="Total variation distance\nfrom bridge sampling", ylabelsize=18,
         title="Accuracy against runtime", titlesize=18,
         xticklabelsize=16, yticklabelsize=16,
     )
     for i in 1:n_paths
         scatter!(
-            ax, hours[i], tvds[i],
+            ax, minutes[i], tvds[i],
             color=(PATH_COLORS[i], 0.7), marker=MARKERS[i], markersize=10,
         )
     end
 
     linkyaxes!(axB, ax)
 
-    # D: mixing between spike/slab patterns
+    # B: mixing between spike/slab patterns
     ax = Axis(
-        f[2,2],
+        f[1,2],
         limits=(nothing, (-0.01, nothing)),
         xlabel=L"Path parameter $\gamma$", xlabelsize=18,
         ylabel="Fraction of particles with implied\nmodel changed in final NUTS round", ylabelsize=18,
@@ -200,7 +194,7 @@ begin
         ["Power\nposteriors", "Alt. geometric\npath", "Non-geometric\npath"],
         labelsize=18, rowgap=10, tellheight=false,
     )
-    colgap!(f.layout, 2, 25)
+    colgap!(f.layout, 2, 30)
 
     for (i, loc) in enumerate([f[1, 1, TopLeft()], f[1, 2, TopLeft()], f[2, 1, TopLeft()], f[2, 2, TopLeft()]])
         Label(loc, string('A' + i - 1),
@@ -210,31 +204,33 @@ begin
         )
     end
 
+    colgap!(f.layout, 2, 25)
+
     display(f)
     save_dir = mkpath(joinpath(@__DIR__, "imgs/"));
     save("$(save_dir)/SMC_paths_insect.png", f, px_per_unit=4);
 end
 
-# Runtime against number of leapfrog steps, and leapfrog steps against NUTS transitions (appendix)
-begin
+# Runtime against number of leapfrog steps, and leapfrog steps against NUTS transitions (appendix).
+# Kept as a backup figure: set to true to redraw it.
+PLOT_NUTS_APPENDIX = false;
+if PLOT_NUTS_APPENDIX
     f = Figure(size=(800, 385), figure_padding=(16, 28, 16, 2)) # left, right, bottom, top
 
-    leapfrog_tick(x) = x == 0 ? L"0" : x == 100000 ? L"10^5" : L"%$(x ÷ 10000)\times 10^4"
-    leapfrog_ticks(xs) = (xs, leapfrog_tick.(xs))
     leapfrog_label = "Number of leapfrog steps\nper particle"
 
     # A: runtime against leapfrog steps
     ax = Axis(
         f[1,1],
         limits=((0, nothing), (0, nothing)),
-        xticks=leapfrog_ticks(0:40000:80000),
+        xticks=0:2000:8000,
         xlabel="Number of leapfrog steps per particle", xlabelsize=18,
-        ylabel="Runtime (hours)", ylabelsize=18,
+        ylabel="Runtime (minutes)", ylabelsize=18,
         xticklabelsize=16, yticklabelsize=16,
     )
     for i in 1:n_paths
         scatter!(
-            ax, n_leapfrogs[i], hours[i],
+            ax, n_leapfrogs[i], minutes[i],
             color=(PATH_COLORS[i], 0.7), marker=MARKERS[i], markersize=10,
         )
     end
@@ -243,7 +239,7 @@ begin
     ax = Axis(
         f[1,2],
         limits=((0, nothing), (0, nothing)),
-        yticks=leapfrog_ticks(0:20000:100000),
+        yticks=0:2000:8000,
         xlabel="Number of NUTS transitions per particle", xlabelsize=18,
         ylabel=leapfrog_label, ylabelsize=18,
         xticklabelsize=16, yticklabelsize=16,

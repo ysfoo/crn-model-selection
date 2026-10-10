@@ -105,6 +105,14 @@ function repeat_5(particles, last_n_nuts, npass, states_before_move; verbose = 0
     return nzeros > 0.01 ? 5 : 0
 end
 
+function repeat_5_min_2(particles, last_n_nuts, npass, states_before_move; verbose = 0, rng=Random.default_rng())
+    if npass < 2
+        return 5
+    end
+    nzeros = mean(p.info.sum_sqjdist == 0. for p in particles)
+    return nzeros > 0.01 ? 5 : 0
+end
+
 function run_5_3(particles, last_n_nuts, npass, states_before_move; verbose = 0, rng=Random.default_rng())
     return npass < 3 ? 5 : 0
 end

@@ -1,25 +1,28 @@
 include(joinpath(@__DIR__, "SMC.jl"))
 using StatsFuns
 
-# SMC305 (moment-interpolated spike-and-slab mixture) with NUTS on the two-slope transformed target and the
-# :distributed backend: maps fitted to the population before the first round of every SMC iteration
-# (`compute_TQB_info`), identity mass matrix, step size updated every round (`nuts_transformed_move`).
-# Usage: julia --project=.. SMC445.jl <seed> [1k|2k|4k|8k]
+# SMC505 (likelihood and prior tempering from the moment-matched unimodal prior) with NUTS on the two-slope
+# transformed target and the :distributed backend: maps fitted to the population before the first round of every SMC
+# iteration (`compute_TQB_info`), identity mass matrix, step size updated every round (`nuts_transformed_move`).
+# Usage: julia --project=.. SMC135.jl <seed> [1k|2k|4k|8k]
 
-# Likelihood and prior tempering. Given p, the prior of each spike-and-slab parameter η is always a mixture of
-# two Gaussians with fixed weights (p for slab, 1-p for spike), so it is normalised for every p and the
-# marginal prior of p stays Logistic along the path. At γ = 0 both components equal the moment-matched
-# Gaussian N(m(p), v(p)); at γ = 1 they are the final slab and spike. Component k has
-#   variance  s_k²(γ) = (1-γ) v(p) + γ σ_k²,
-#   mean      μ_k(γ)  = m(p) + sqrt(γ) (μ_k - m(p)),
-# which keeps the mean and variance of the mixture at m(p) and v(p) for all γ.
-run_str = "SMC445"
+# Likelihood and prior tempering. Only the prior of the spike-and-slab parameters η given p is tempered, from a
+# unimodal prior to the spike-and-slab mixture. The unimodal prior is the Gaussian that matches the mean and
+# variance of the mixture given p (so it depends on p). The priors on p and the noise parameters
+# (`add_logprior`) are fixed along the path.
+run_str = "SMC135"
 
 # Mean and variance of p * slab + (1-p) * spike (law of total variance). At p = 1/2 with the current
 # hyperparameters, these are -8 and 68.
 unimodal_mean(p) = p*μ_slab + (1-p)*μ_spike
 unimodal_var(p) = p*σ_slab^2 + (1-p)*σ_spike^2 + p*(1-p)*(μ_slab-μ_spike)^2
 unimodal_prior(p) = Normal(unimodal_mean(p), sqrt(unimodal_var(p)))
+
+ss_unimodal_logprior(θ) = begin
+    p = logistic(θ[p_idx])
+    m, s = unimodal_mean(p), sqrt(unimodal_var(p))
+    sum(normlogpdf(m, s, θ[d]) for d in ss_idxs)
+end
 
 # Sample from the initial prior: θ_p ~ Logistic, η ~ unimodal prior given p, noise parameters ~ `noise_prior`.
 function init_sampler(rng)
@@ -36,33 +39,17 @@ function init_sampler(rng)
 end
 
 move_func = nuts_transformed_move;  init_stepsize = 0.5;
-n_nuts_func = repeat_5;
+n_nuts_func = repeat_5_min_2;
 ldp_builder = make_ldp;
-prior_path(θ, γ) = begin
-    logp, log1mp = loglogistic(θ[p_idx]), log1mlogistic(θ[p_idx])
-    p = logistic(θ[p_idx])
-    m, v = unimodal_mean(p), unimodal_var(p)
-    μ_slab_γ = m + sqrt(γ)*(μ_slab - m)
-    μ_spike_γ = m + sqrt(γ)*(μ_spike - m)
-    σ_slab_γ = sqrt((1-γ)*v + γ*σ_slab^2)
-    σ_spike_γ = sqrt((1-γ)*v + γ*σ_spike^2)
-    sum(
-        begin
-            x = θ[d]
-            logaddexp(
-                normlogpdf(μ_spike_γ, σ_spike_γ, x) + log1mp,
-                normlogpdf(μ_slab_γ, σ_slab_γ, x) + logp
-            )
-        end for d in ss_idxs
-    ) + add_logprior(θ)
-end
+prior_path(θ, γ) = (1-γ) * ss_unimodal_logprior(θ) + γ * ss_bimodal_logprior(θ) + add_logprior(θ)
 
 # Command-line arguments: the seed, then optionally the population size (1k, 2k, 4k or 8k; default 8k).
 seed = parse(Int64, ARGS[1])
 # seed = 1
 
 psize_str = length(ARGS) >= 2 ? ARGS[2] : "8k"
-pop_size = Dict("1k" => 1000, "2k" => 2000, "4k" => 4000, "8k" => 8000)[psize_str]; target_ess = 0.8pop_size; init_pop_size = pop_size;
+pop_size = Dict("1k" => 1000, "2k" => 2000, "4k" => 4000, "8k" => 8000)[psize_str]; 
+target_ess = 0.8pop_size; init_pop_size = pop_size;
 
 fname = joinpath(mkpath(joinpath(@__DIR__, "output/seed$seed")), "$(run_str)_$(psize_str).jld2");
 display(fname)

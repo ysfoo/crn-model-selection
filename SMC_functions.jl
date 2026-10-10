@@ -673,7 +673,7 @@ function SMC_iteration!(
 
     @save fname all_particles iter targetinfos npass_vec smc_times wall_times startup_times prior_path
 
-    return false
+    return (γ >= 1.)
 end
 
 
@@ -724,6 +724,12 @@ end
 
 function get_targetinfo!(γ, iter, prior_path)
     return (γ = γ,)
+end
+
+extract_γ(targetinfo) = begin
+    hasproperty(targetinfo, :γ) && return targetinfo.γ
+    hasproperty(targetinfo, :β) && return targetinfo.β
+    return last(targetinfo)
 end
 
 function log_backend(backend)
