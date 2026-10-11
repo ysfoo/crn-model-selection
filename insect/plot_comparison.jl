@@ -6,7 +6,7 @@ include(joinpath(@__DIR__, "../plot_helpers.jl"));
 
 # Fetch packages.
 using Distributions, LinearAlgebra, LogExpFunctions, Optim, OrdinaryDiffEq, PDMats, Random
-using JLD2, ProgressMeter, Suppressor
+using JLD2, Printf, ProgressMeter, Suppressor
 using Bijectors, LogDensityProblems, LogDensityProblemsAD
 using Pathfinder, PSIS, StableRNGs, BridgeSampling
 using AdvancedHMC, Bijectors, LinearAlgebra, LogDensityProblems, LogDensityProblemsAD, MCMCChains, Turing
@@ -15,7 +15,7 @@ using AdvancedHMC, Bijectors, LinearAlgebra, LogDensityProblems, LogDensityProbl
 
 # Posterior variance
 vrats_fname = joinpath(@__DIR__, "output/var_ratios.jld2");
-LOAD_VAR_RATIOS = false;
+LOAD_VAR_RATIOS = true;
 if LOAD_VAR_RATIOS
     @load vrats_fname var_ratios
 else
@@ -119,7 +119,7 @@ else
 end
 
 MCMCstats_fname = joinpath(@__DIR__, "output/MCMCstats.jld2");
-LOAD_MCMCSTATS = false;
+LOAD_MCMCSTATS = true;
 if LOAD_MCMCSTATS
     @load MCMCstats_fname MCMC_miness MCMC_maxrhat MCMC_times
 else
@@ -176,7 +176,7 @@ end
 
 logZs_fname = joinpath(@__DIR__, "output/logZs.jld2");
 
-LOAD_LOGZS = false
+LOAD_LOGZS = true
 if LOAD_LOGZS
     @load logZs_fname all_times BIC_logZvecs LIS_logZvecs orig_logZvecs rAMIS_logZvecs BS_logZvecs
 else
@@ -323,8 +323,18 @@ ess_hists = fit.(Histogram, all_essvecs, Ref(ess_bins));
 ess_histmaxs = getproperty.(ess_hists, :weights) .|> maximum
 ess_heights = ess_histmaxs ./ maximum(ess_histmaxs)
 
+# Thin baseline of a histogram drawn with `direction=:x` at `offset`, spanning the occupied bins (as in plot_SMC_paths.jl)
+function hist_baseline!(ax, v, bins, offset; color)
+    w = fit(Histogram, v, bins).weights
+    lo, hi = findfirst(>(0), w), findlast(>(0), w)
+    linesegments!(ax, [Point2f(offset, bins[lo]), Point2f(offset, bins[hi+1])]; color, linewidth=1)
+end
+
+SDR_TICKS = (0:0.2:1, [@sprintf("%.1f", x) for x in 0:0.2:1])
+SDR_LIMITS = (0, 1.07) # largest max posterior-to-prior SD ratio is 1.045
+
 begin
-    f = Figure(size=(1200, 1200))
+    f = Figure(size=(1200, 1120))
 
     cats = repeat(1:4, inner=n_feasible)
 
@@ -332,10 +342,10 @@ begin
         f[1,1],
         yticklabelsize=16,
         limits=(nothing, (-0.01, nothing)),
-        ylabel="Total variation distance\nfrom bridge sampling", ylabelsize=18,
+        ylabel="TVD from bridge sampling", ylabelsize=18,
         title="Discrepancy of posterior distributions\nfrom gold standard", titlesize=18,
         xlabel="Per-dataset runtime (hours)", xlabelsize=18,
-        xticklabelsize=16, 
+        xticks=0:ceil(Int, maximum(hrs_mat[1:4,:])), xticklabelsize=16, 
     )
     
     for i in 1:4
@@ -354,13 +364,13 @@ begin
         title="Estimate error vs\nparameter identifiability", titlesize=18,
         xlabel="Max posterior-to-prior SD ratio",
         ylabel="Log-evidence error relative\nto bridge sampling",
-        xticklabelsize=16, yticklabelsize=16,
+        xticks=SDR_TICKS, xticklabelsize=16, yticklabelsize=16,
         xlabelsize=18, ylabelsize=18,
         # yscale=symsqrt, 
         # yticks=(tick_vals, tick_labels),
-        limits=((0, 1.1), nothing)
+        limits=(SDR_LIMITS, nothing)
     )
-    lines!([0, 1.1], [0, 0], alpha=0.5, color=:black, linestyle=:dash)
+    lines!(collect(SDR_LIMITS), [0, 0], alpha=0.5, color=:black, linestyle=:dash)
     func = identity
     for (i, errs) in enumerate([LIS_errors, orig_errors, rAMIS_errors])
         scatter!(
@@ -376,12 +386,12 @@ begin
         yticks=(10 .^ (1:6), [L"10^{%$p}" for p in 1:6]),
         yticklabelsize=16,
         yscale=log10,
-        ylabel="Effective sample size", ylabelsize=18,
-        title="Effective sample size for\nimportance sampling methods", titlesize=18,
+        ylabel="ESS", ylabelsize=18,
+        title="ESS for importance sampling methods", titlesize=18,
         # xticks=(1:3, ["Laplace IS", "Standard AMIS", "Robust AMIS"]),
         # xticklabelrotation=π/6,
         xticks=(1:3, ["Laplace\nIS", "Standard\nAMIS", "Robust\nAMIS"]),
-        xticklabelsize=18, xgridvisible=true
+        xticklabelsize=18,
     )
     
     for i in 1:3
@@ -390,18 +400,19 @@ begin
             scale_to=-0.9*ess_heights[i], offset=i, 
             direction=:x, bins=ess_bins
         )
+        hist_baseline!(ax21, all_essvecs[i], ess_bins, i; color=COLORS[i+1])
     end
 
     ax22 = Axis(
         f[2,2], 
-        title="Effective sample size vs\nparameter identifiability", titlesize=18,
+        title="ESS vs parameter identifiability", titlesize=18,
         xlabel="Max posterior-to-prior SD ratio",
-        ylabel="Effective sample size",
-        xticklabelsize=16, yticklabelsize=16,
+        ylabel="ESS",
+        xticks=SDR_TICKS, xticklabelsize=16, yticklabelsize=16,
         xlabelsize=18, ylabelsize=18,
         yscale=log10, 
         yticks=(10 .^ (1:6), [L"10^{%$p}" for p in 1:6]),
-        limits=((0, 1.1), nothing)
+        limits=(SDR_LIMITS, nothing)
     )
     for (i, essmat) in enumerate([LIS_essmat, orig_essmat, rAMIS_essmat])
         scatter!(
