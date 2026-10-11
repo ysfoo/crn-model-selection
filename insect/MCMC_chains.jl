@@ -52,17 +52,14 @@ function main(model_idx)
     seed = hash((genmodel_idx, model_idx, "MCMC_chains"))
     rng = StableRNG(seed)
 
-    # Reject initial points whose log density is more than `max_lp_drop` below the MAP's. The heavy tails of the t
-    # proposal occasionally give a finite but hopeless start (log density around -1e6), from which the chain's step size
-    # collapses during warmup and it never reaches the posterior (data 7 model 29, data 42 model 19, data 44 model 10).
-    # Models with no rejected draw use the random stream as before, so they keep their initial points and chain seeds.
+    # Reject initial points whose log density is more than `max_lp_drop` below the MAP's.
     max_lp_drop = 1000
     lp_MAP = LogDensityProblems.logdensity(target, MAP)
     init_params = [
         begin
             p = copy(collect(MAP))
             while true
-                p = rand(rng, MvTDist(4, MAP, Σ))
+                p = rand(rng, MvNormal(MAP, Σ))
                 lp = LogDensityProblems.logdensity(target, p)
                 isfinite(lp) && lp > lp_MAP - max_lp_drop && break
             end

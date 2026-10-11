@@ -40,8 +40,8 @@ The example in Section 5.2 features a hypothetical insect with egg, larva, and a
 
 3. Running `insect/laplace_IS.jl` performs Laplace IS for all 64 models. The script takes in the dataset index `[d]` (1 to 44) as a command line argument, and saves the result (all models) for dataset `[d]` and model `[m]` in `insect/output/data[d]/laplace_IS_model[m].jld2`. Standard AMIS and robust AMIS are run similarly using the scripts  `insect/orig_AMIS.jl` and `insect/robust_AMIS.jl` instead.
 
-4. Running `insect/MCMC_chains.jl` runs MCMC to sample from the parameter posterior distributions of all 64 models. The script takes in the dataset index `[d]` (1 to 44) as a command line argument, and saves the result (all models) for dataset `[d]` and model `[m]` in `insect/output/data[d]/chains_model[m].jld2`.
+4. Running `insect/MCMC_chains.jl` runs MCMC to sample from the parameter posterior distributions of all 64 models. The script takes in the dataset index `[d]` (1 to 44) as a command line argument, and saves the result (all models) for dataset `[d]` and model `[m]` in `insect/output/data[d]/chains_8k_model[m].jld2`.
 
-5. Running `insect/bridge_sampling.jl` post-processes the MCMC samples for bridge sampling. The script takes in the dataset index `[d]` (1 to 44) as a command line argument, and saves the result (all models) for dataset `[d]` and model `[m]` in `insect/output/data[d]/BS_model[m].jld2`.
+5. Running `insect/bridge_sampling.jl` post-processes the MCMC samples for bridge sampling. The script takes in the dataset index `[d]` (1 to 44) as a command line argument, and saves the result (all models) for dataset `[d]` and model `[m]` in `insect/output/data[d]/BS_8k_model[m].jld2`.
 
 6. The scripts `insect/plot_comparison.jl`, `insect/plot_model_posterior.jl`, `insect/plot_data.jl`, `insect/plot_param_posteriors.jl` reproduce Figure 3, Figure 4, Figure S3, Figure S4, respectively. The variables named `LOAD_XXX` in `insect/plot_comparison.jl` should be set to `false` when running the script for the first time.
