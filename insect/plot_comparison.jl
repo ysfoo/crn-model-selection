@@ -319,6 +319,7 @@ tvd_heights = tvd_histmaxs ./ maximum(tvd_histmaxs)
 all_essvecs = [vec(LIS_essmat), vec(orig_essmat), vec(rAMIS_essmat)];
 extrema.(all_essvecs)
 ess_bins = logrange(1, 1e6, 31)[3:end]
+ESS_YMIN = 3.5 # smallest ESS is 4.6, in the bin from 3.98
 ess_hists = fit.(Histogram, all_essvecs, Ref(ess_bins));
 ess_histmaxs = getproperty.(ess_hists, :weights) .|> maximum
 ess_heights = ess_histmaxs ./ maximum(ess_histmaxs)
@@ -327,7 +328,7 @@ ess_heights = ess_histmaxs ./ maximum(ess_histmaxs)
 function hist_baseline!(ax, v, bins, offset; color)
     w = fit(Histogram, v, bins).weights
     lo, hi = findfirst(>(0), w), findlast(>(0), w)
-    linesegments!(ax, [Point2f(offset, bins[lo]), Point2f(offset, bins[hi+1])]; color, linewidth=1)
+    linesegments!(ax, [Point2f(offset, bins[lo]), Point2f(offset, bins[hi+1])]; color, linewidth=0.5)
 end
 
 SDR_TICKS = (0:0.2:1, [@sprintf("%.1f", x) for x in 0:0.2:1])
@@ -387,6 +388,7 @@ begin
         yticklabelsize=16,
         yscale=log10,
         ylabel="ESS", ylabelsize=18,
+        limits=(nothing, (ESS_YMIN, nothing)),
         title="ESS for importance sampling methods", titlesize=18,
         # xticks=(1:3, ["Laplace IS", "Standard AMIS", "Robust AMIS"]),
         # xticklabelrotation=π/6,
@@ -412,7 +414,7 @@ begin
         xlabelsize=18, ylabelsize=18,
         yscale=log10, 
         yticks=(10 .^ (1:6), [L"10^{%$p}" for p in 1:6]),
-        limits=(SDR_LIMITS, nothing)
+        limits=(SDR_LIMITS, (ESS_YMIN, nothing))
     )
     for (i, essmat) in enumerate([LIS_essmat, orig_essmat, rAMIS_essmat])
         scatter!(
@@ -452,8 +454,8 @@ begin
             ylabel=i == 1 ? "Bridge sampling" : "", ylabelsize=18
         )
         vcat_pvecs_other = reduce(vcat, pvecs_other)
-        pmax = pvecs_BS .|> maximum |> maximum
-        lines!([0, pmax], [0, pmax], color=(:grey10, 0.8), linestyle=:dash)
+        # the identity line extends past the data without changing the axis limits
+        lines!([0, 1], [0, 1], color=(:grey10, 0.8), linestyle=:dash, xautolimits=false, yautolimits=false)
         sc = scatter!(
             vcat_pvecs_other, reduce(vcat, pvecs_BS),
             color=sqrt.(vec(var_ratios')), colorrange=(0, 0.6), #colormap=Reverse(:viridis),
@@ -475,7 +477,7 @@ begin
         padding = (0,32, 0, 0), # left, right, bottom, top
         halign = :right, valign = :center,
     )
-    rowgap!(g, 1, -10)
+    rowgap!(g, 1, 0)
     rowsize!(f.layout, 3, Relative(0.28))
 
     display(f)
