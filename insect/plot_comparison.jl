@@ -437,7 +437,7 @@ begin
     for i in 1:4
         label = ["A", "B", "C", "D"][i]
         loc = [f[1, 1, TopLeft()], f[1, 2, TopLeft()], f[2, 1, TopLeft()], f[2, 2, TopLeft()]][i]
-        rpad = [32, 32, 32, 32][i]
+        rpad = [32, 52, 32, 52][i] # B and D clear the two-line y label of B
         Label(loc, label,
             fontsize = 24, font = :bold,
             padding = (0, rpad, 0, -30), # left, right, bottom, top
