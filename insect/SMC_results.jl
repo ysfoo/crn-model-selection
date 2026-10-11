@@ -53,7 +53,7 @@ final_logprior_func(θ) = sum(logpdf(dist, val) for (dist, val) in zip(final_dis
 convert_HMS(s) = string(floor(Int, s÷3600), ":", lpad(floor(Int, s%3600÷60), 2, '0'), ":", lpad(floor(Int, s%60), 2, '0'));
 
 # Load previous results
-logZs_fname = joinpath(@__DIR__, "output/logZs_backup.jld2");
+logZs_fname = joinpath(@__DIR__, "output/logZs.jld2");
 @load logZs_fname rAMIS_logZvecs BS_logZvecs all_times;
 pvecs_BS = [exp.(logZvec .- logsumexp(logZvec)) for logZvec in BS_logZvecs];
 pvecs_rAMIS = [exp.(logZvec .- logsumexp(logZvec)) for logZvec in rAMIS_logZvecs];
@@ -76,7 +76,7 @@ if isfile(SMC_fname)
 end;
 
 tmp = 0;
-@showprogress for dir_idx in 28:n_feasible
+@showprogress for dir_idx in 1:n_feasible
     fname = joinpath(@__DIR__, "output/data$(dir_idx)/$(run_str)_$(psize_str).jld2")
     if hours_SMC[dir_idx] > 0
         tmp += 1

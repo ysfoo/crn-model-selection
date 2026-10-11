@@ -176,8 +176,9 @@ end
 # `nuts_invmass_move` multiplies this stepsize by exp(jitter * randn()).
 # - `weights`: if `use_ngrad`, particles are weighted by `info.curr_n_grad`, default on.
 # - `max_dlog`: cap on |log new ε - mean log ε| (default: no cap), to limit extrapolation beyond the spread of the step sizes.
-# - Fallback (no acceptance information, too few particles, no spread in step sizes, or a non-negative slope): the
-#   geometric mean of the particles' step sizes is used, i.e. the step size is left unchanged.
+# - Returns `nothing` (the caller keeps its nominal step size) if there are too few particles, no spread in step sizes or
+#   in acceptance rates (e.g. every transition diverged, all acceptances 0), a non-negative slope, or a solution that is
+#   not a positive, finite step size.
 function fit_acc_stepsize(stepsizes, accs; acc_target=0.8, weights=nothing, min_obs=20, max_dlog=Inf)
     ok = findall(eachindex(stepsizes)) do i
         isfinite(stepsizes[i]) && stepsizes[i] > 0 && isfinite(accs[i]) &&
@@ -188,6 +189,7 @@ function fit_acc_stepsize(stepsizes, accs; acc_target=0.8, weights=nothing, min_
     w = isnothing(weights) ? ones(length(ok)) : Float64.(weights[ok])
     x̄ = sum(w .* x) / sum(w); xc = x .- x̄
     maximum(abs, xc) > 1e-8 || return nothing
+    maximum(y) - minimum(y) > 1e-8 || return nothing
 
     β = [logit(clamp(sum(w .* y) / sum(w), 0.01, 0.99)), 0.]
     # Fisher scoring
@@ -205,7 +207,9 @@ function fit_acc_stepsize(stepsizes, accs; acc_target=0.8, weights=nothing, min_
     end
     β[2] < 0 || return nothing
     dlog = clamp((logit(acc_target) - β[1]) / β[2], -max_dlog, max_dlog)
-    return (stepsize = exp(x̄ + dlog), slope = β[2], centre = exp(x̄))
+    stepsize = exp(x̄ + dlog)
+    isfinite(stepsize) && stepsize > 0 || return nothing
+    return (stepsize = stepsize, slope = β[2], centre = exp(x̄))
 end
 
 # Step size for the next round: quasi-binomial fit of acceptance on log step size (target `acc_target`) in pass 1; in later
@@ -218,6 +222,7 @@ function qb_stepsize(
     stepsizes = [p.stepsize for p in particles]
     if isnothing(prev_pop_info)
         valid = filter(s -> isfinite(s) && s > 0, stepsizes)
+        isempty(valid) && error("no particle has a positive, finite step size")
         stepsize = exp(mean(log.(valid))) # nominal stepsize is previous stepsize
     else
         stepsize = prev_pop_info.stepsize  # base step size of the previous pass
@@ -235,6 +240,12 @@ function qb_stepsize(
         stepsize = fit.stepsize
     end
     return stepsize
+end
+
+# Particles used to estimate a mass matrix or maps: finite log target and score, and not in the bottom 1% by log target.
+function finite_and_not_lowest(logp, G; drop_frac=0.01)
+    ok = [isfinite(logp[i]) && all(isfinite, view(G, :, i)) for i in eachindex(logp)]
+    return ok .& (logp .>= quantile(logp[ok], drop_frac))
 end
 
 ## Nutpie-style mass matrix
@@ -257,7 +268,7 @@ function compute_invmass(particles, target, npass, prev_pop_info=nothing)
         G[:, i] .= DiffResults.gradient(result)
     end
 
-    keep = logp .>= quantile(logp, 0.01)   # drop bottom 1% by log target density
+    keep = finite_and_not_lowest(logp, G)
     var_x     = vec(var(view(X, :, keep); dims = 2))
     var_alpha = vec(var(view(G, :, keep); dims = 2))
     invmass = sqrt.(var_x ./ var_alpha)
@@ -316,15 +327,15 @@ end
 ## Population info for `nuts_transformed_move`: per-coordinate two-slope maps (transform_maps.jl) and the step size
 # Before the first round of every SMC iteration, fit a two-slope map to every coordinate by minimising the sample Fisher
 # divergence with the log-slope penalty λ = λN / N (default 100 / N); the fit uses no spike-and-slab threshold. As in
-# `compute_invmass`, the 1% of particles with the lowest log target are left out of the fit. A fit whose asymptotes are
-# far from the slopes the particles see (`check_asymptotes`) falls back to the equal-slope optimum (the affine nutpie
-# map). NUTS then runs in u with the identity mass matrix, since the D-optimal maps already set the scale of each
-# coordinate. The maps are reused from `prev_pop_info` in later rounds of the same iteration (`refit_each_pass=true`
-# refits them every round). The step size follows `qb_stepsize`, updated every round; particles carry their step size
-# from the previous round, in latent units.
+# `compute_invmass`, particles with a non-finite log target or score and the 1% with the lowest log target are left out
+# of the fit. A fit whose asymptotes are far from the slopes the particles see, or that does not invert the particles
+# (`check_map`), falls back to the equal-slope optimum (the affine nutpie map). NUTS then runs in u with the identity
+# mass matrix, since the D-optimal maps already set the scale of each coordinate. The maps are reused from
+# `prev_pop_info` in later rounds of the same iteration (`refit_each_pass=true` refits them every round). The step size
+# follows `qb_stepsize`, updated every round; particles carry their step size from the previous round, in latent units.
 function compute_TQB_info(
     particles, target, npass, prev_pop_info=nothing; acc_target=0.8, jitter=0.2, max_dlog=Inf, use_ngrad=false,
-    min_obs=20, λN=DEFAULT_λN, ζ_min=0.2, refit_each_pass=false, verbose=1,
+    min_obs=20, λN=DEFAULT_λN, ζ_min=0.4, refit_each_pass=false, verbose=1,
 )
     stepsize = qb_stepsize(particles, npass, prev_pop_info; acc_target, max_dlog, use_ngrad, min_obs)
     maps = (isnothing(prev_pop_info) || refit_each_pass) ? fit_maps(particles, target, npass; λN, ζ_min, verbose) :
@@ -337,7 +348,7 @@ function compute_TQB_info(
 end
 
 # Two-slope maps for every coordinate, fitted to the population (see `compute_TQB_info`).
-function fit_maps(particles, target, npass; λN=DEFAULT_λN, ζ_min=0.2, verbose=1)
+function fit_maps(particles, target, npass; λN=DEFAULT_λN, ζ_min=0.4, verbose=1)
     # scores at the current states, as in `compute_invmass`
     logp_func = Base.Fix1(LogDensityProblems.logdensity, target)
     x1 = particles[1].state
@@ -350,13 +361,13 @@ function fit_maps(particles, target, npass; λN=DEFAULT_λN, ζ_min=0.2, verbose
         logp[i] = DiffResults.value(result)
         G[:, i] .= DiffResults.gradient(result)
     end
-    keep = logp .>= quantile(logp, 0.01)   # drop bottom 1% by log target density
+    keep = finite_and_not_lowest(logp, G)
 
-    maps = Vector{TwoSlope}(undef, d)
+    maps = Vector{TwoSlope{Float64}}(undef, d)
     t_fit = @elapsed for k in 1:d
         θ, α = X[k, keep], G[k, keep]
         f = fit_twoslope(θ, α; λ=λN / length(θ), ζ_min)
-        maps[k], reason = check_asymptotes(f.m, f.u, θ, α)
+        maps[k], reason = check_map(f.m, θ, α)
         isempty(reason) || @warn "Two-slope fit of coordinate $k replaced by the equal-slope map" reason f.m
     end
     if verbose > 0
@@ -401,10 +412,10 @@ end
 # `target` is used on the master (a copy per task with :threads); with :distributed, `target_spec = (ldp_builder,
 # prior_path, γ)` rebuilds it on the worker, so `target` must equal `ldp_builder(prior_path, γ)`. `f` may only modify its
 # target (`args` and the items are shared between tasks). `on_done(n_done)` is called on the master after each item
-# (:serial, :threads) or batch (:distributed), never concurrently. `batch_size` (:distributed only) defaults to about
-# 25 batches per worker.
+# (:serial, :threads) or batch (:distributed), never concurrently. `batch_size` (:distributed only) is small so that
+# a few expensive items hold up little other work in their batch.
 function particle_map(
-    f, args, items, target, target_spec, backend; batch_size=nothing, on_done=(n_done)->nothing,
+    f, args, items, target, target_spec, backend; batch_size=5, on_done=(n_done)->nothing,
 )
     n = length(items)
     results = Vector{Any}(undef, n)
@@ -438,8 +449,7 @@ function particle_map(
             end
         end
     elseif backend === :distributed
-        bs = isnothing(batch_size) ? max(1, cld(n, 25 * nworkers())) : batch_size
-        batches = collect(Iterators.partition(1:n, bs))
+        batches = collect(Iterators.partition(1:n, batch_size))
         # One feeding task per worker, so a worker never has two calls in flight. The tasks run on the master thread
         # and only switch at `remotecall_fetch`, so reading and advancing `next_b` (and `n_done`) cannot interleave.
         next_b = Ref(1)
@@ -524,6 +534,12 @@ function perform_moves!(
             move_time += t
         end
         ProgressMeter.finish!(pbar)
+        # A round in which no particle moved (e.g. every transition diverged, or a step size of 0) would freeze the run
+        # while reweighting still advances γ, so stop with the last checkpoint intact instead.
+        if all(p -> p.info.curr_esjd_per_grad == 0, particles)
+            stepsize = get(pop_info, :stepsize, "per particle")
+            error("no particle moved in round $npass of iteration $iter (step size $stepsize)")
+        end
     end
     return npass, move_time
 end
@@ -627,6 +643,9 @@ function SMC_iteration!(
     # Resample  
     ws = exp.(logws .- maximum(logws))      
     idxs = stratified_sampling(ws, pop_size; rng=rng)
+    # Stratified resampling returns sorted indices, so copies of a lineage would stay contiguous from iteration to
+    # iteration; shuffling spreads lineages in expensive regions (e.g. stiff solves) over threads, workers and batches.
+    shuffle!(rng, idxs)
     particles = [
         begin
             p = particles[idx]

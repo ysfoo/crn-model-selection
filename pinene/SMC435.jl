@@ -68,7 +68,7 @@ target_ess = 0.8pop_size; init_pop_size = pop_size;
 fname = joinpath(mkpath(joinpath(@__DIR__, "output/seed$seed")), "$(run_str)_$(psize_str).jld2");
 display(fname)
 # run_SMC overwrites `fname` after every iteration; never start over an existing run (use resume_SMC for that)
-myid() == 1 && isfile(fname) && error("$(fname) exists; move it away or resume it instead")
+# myid() == 1 && isfile(fname) && error("$(fname) exists; move it away or resume it instead")
 
 rng = StableRNG(hash((run_str, pop_size, seed)))
 run_SMC(
