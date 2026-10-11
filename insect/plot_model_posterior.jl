@@ -111,8 +111,8 @@ else
             push!(BS_logZvecs[dir_idx], timed_res.value.value)
         end
 
-        # @info "Data $dir_idx time (min)" MAP_time MAP_time+hess_time+LIS_time MAP_time+hess_time+orig_time rAMIS_time chains_time BS_time
-        times = [MAP_time, MAP_time+hess_time+LIS_time, MAP_time+hess_time+orig_time, rAMIS_time, chains_time+BS_time]
+        # @info "Data $dir_idx time (min)" MAP_time MAP_time+LIS_time MAP_time+orig_time rAMIS_time chains_time BS_time
+        times = [MAP_time, MAP_time+LIS_time, MAP_time+orig_time, rAMIS_time, chains_time+BS_time]
         
         push!(all_times, times)
         flush(stderr)
@@ -150,8 +150,6 @@ tvds = calc_tvd.(rAMIS_logZvecs, BS_logZvecs);
 n_plot = 10;
 ps = parameters(models[end]);
 
-# for dir_idx in 1:44
-# println("Data $(dir_idx)")
 dir_idx = 25;
 OUTDIR = joinpath(@__DIR__, "output/data$(dir_idx)");
 genmodel_idx = feasible_idxs[dir_idx];
@@ -174,7 +172,12 @@ param_labels = [
 COLORS = [:grey60; Makie.wong_colors()[[1, 3, 4, 2]]];
 method_names = ["BIC", "Laplace IS", "Standard AMIS", "Robust AMIS", "Bridge sampling"];
 
-begin
+# Model posterior summary for one dataset, saved to imgs/model_posts/data<dir_idx>.png
+function plot_model_posts(dir_idx)
+    logZvec = BS_logZvecs[dir_idx];
+    pvec = exp.(logZvec .- logsumexp(logZvec));
+    to_plot = sortperm(pvec, rev=true)[1:n_plot];
+
     f = Figure(size=(1080, 540))
 
     ax = Axis(
@@ -259,12 +262,15 @@ begin
     rowsize!(f.layout, 2, Auto(0.55))
     rowgap!(f.layout, 1, 0) 
 
-    display(f)
     save_dir = mkpath(joinpath(@__DIR__, "imgs/model_posts/"));
     save("$(save_dir)/data$(dir_idx).png", f, px_per_unit=4);
+    return f
 end
 
-# end
+display(plot_model_posts(dir_idx))
+@showprogress for dir_idx in 1:n_feasible
+    plot_model_posts(dir_idx)
+end
 
 
 ## Single-model predictions

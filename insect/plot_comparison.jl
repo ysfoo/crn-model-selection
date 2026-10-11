@@ -48,7 +48,7 @@ sort(vec(var_ratios), rev=true)[1:10]
 hist(sqrt.(vec(var_ratios)), bins=0:0.1:1)
 sum(abs.(sqrt.(vec(var_ratios)) .- 0.55) .< 0.05)
 # 1401/2816
-1458/2816
+1455/2816
 
 begin
     dir_idx = 3
@@ -90,7 +90,7 @@ end
 
 # Importance sampling effective sample sizes
 ess_fname = joinpath(@__DIR__, "output/ess.jld2");
-LOAD_ESS = false
+LOAD_ESS = true
 if LOAD_ESS
     @load ess_fname LIS_essmat orig_essmat rAMIS_essmat rAMIS_khatmat
 else
@@ -150,6 +150,7 @@ top_idxs = CartesianIndices(MCMC_essmat)[tmp_idxs]
 MCMC_essmat[top_idxs]
 
 sum(reduce(vcat, MCMC_maxrhat) .> 1.01)
+sort(reduce(vcat, MCMC_maxrhat))[end-1:end]
 maximum(MCMC_maxrhat .|> maximum)
 for dir_idx in 1:n_feasible
     for model_idx in 1:n_models
@@ -245,8 +246,8 @@ else
             push!(BS_logZvecs[dir_idx], timed_res.value.value)
         end
 
-        # @info "Data $dir_idx time (min)" MAP_time MAP_time+hess_time+LIS_time MAP_time+hess_time+orig_time rAMIS_time chains_time BS_time
-        times = [MAP_time, MAP_time+hess_time+LIS_time, MAP_time+hess_time+orig_time, rAMIS_time, chains_time+BS_time]
+        # @info "Data $dir_idx time (min)" MAP_time MAP_time+LIS_time MAP_time+orig_time rAMIS_time chains_time BS_time
+        times = [MAP_time, MAP_time+LIS_time, MAP_time+orig_time, rAMIS_time, chains_time+BS_time]
         
         push!(all_times, times)
         flush(stderr)

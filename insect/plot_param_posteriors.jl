@@ -9,11 +9,6 @@ using AdvancedHMC, Bijectors, BridgeSampling, LogDensityProblems, LogDensityProb
 
 # Posterior plots
 
-# dir_idx = 3
-dir_idx = 25;
-genmodel_idx = feasible_idxs[dir_idx];
-OUTDIR = joinpath(@__DIR__, "output/data$(dir_idx)");
-
 param_labels = [
     L"\lambda_{EL}", L"\lambda_{LA}", L"\rho", 
     L"\delta_E", L"\delta_L", L"\delta_A", 
@@ -21,10 +16,18 @@ param_labels = [
 ];
 sym2label = Dict(zip(Symbol.(parameters(models[end])), param_labels))
 
-@nowarn_load "$OUTDIR/MAP.jld2" model_fits;
-@load "$OUTDIR/MAP_hess.jld2" MAP_hessians;
+# Pair plot of log10-parameter posterior samples under model `model_idx` for dataset `dir_idx`,
+# saved to imgs/post_logparams/data<dir_idx>_model<model_idx>.png
+function plot_param_posts(dir_idx, model_idx)
+    genmodel_idx = feasible_idxs[dir_idx];
+    OUTDIR = joinpath(@__DIR__, "output/data$(dir_idx)");
+    @nowarn_load "$OUTDIR/MAP.jld2" model_fits;
+    @load "$OUTDIR/MAP_hess.jld2" MAP_hessians;
 
-for model_idx in [64]
+    mechs = join([sym2label[Symbol(p)] for p in parameters(models[genmodel_idx])[4:end-1]], ",\\, ")
+    model_str = model_idx == n_models ? "saturated model" : "model $model_idx"
+    title = L"\textbf{Posterior samples under %$(model_str) for data generated with death mechanisms }%$(mechs)"
+
     d = nparams[model_idx]
     ps = parameters(models[model_idx])
     
@@ -46,7 +49,7 @@ for model_idx in [64]
         eachcol(X),
         [MAP], [Σ],
         # title="Posterior samples under model $model_idx\nfor data generated from model $genmodel_idx",
-        title=L"\textbf{Posterior samples under saturated model for data generated with death mechanisms }\delta_E,\, \delta_L,\, \delta_A,\, \kappa_L", 
+        title=title, 
         titlesize=20,
         figsize=(120*d+40, 120*d+40), skip_upper=true,
         scatter_kwargs=(color=(:grey30, 0.01), markersize=4),
@@ -125,13 +128,26 @@ for model_idx in [64]
         labelsize=18, rowgap=10, tellheight=false, tellwidth=false, halign=:center, valign=:center
     )
 
-    display(f)
     save_dir = mkpath(joinpath(@__DIR__, "imgs/post_logparams/"))
     mkpath(save_dir)
     save("$(save_dir)/data$(dir_idx)_model$(model_idx).png", f, px_per_unit=4)
+    return f
 end
 
+# dir_idx = 3
+dir_idx = 25;
+for model_idx in [64]
+    display(plot_param_posts(dir_idx, model_idx))
+end
+
+exit()
+
 # Old code
+
+genmodel_idx = feasible_idxs[dir_idx];
+OUTDIR = joinpath(@__DIR__, "output/data$(dir_idx)");
+@nowarn_load "$OUTDIR/MAP.jld2" model_fits;
+@load "$OUTDIR/MAP_hess.jld2" MAP_hessians;
 
 @showprogress for model_idx in 1:2
     d = nparams[model_idx]
